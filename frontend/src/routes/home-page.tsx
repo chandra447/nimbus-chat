@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   CircleDot,
+  Copy,
   Globe,
   LoaderCircle,
   MessageSquare,
@@ -144,6 +145,33 @@ function Markdown({ content }: { content: string }) {
         {content}
       </ReactMarkdown>
     </div>
+  )
+}
+
+function CopyButton({ text, className }: { text: string; className?: string }) {
+  const [copied, setCopied] = useState(false)
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      className={cn(
+        'inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[11px] text-zinc-300 transition hover:bg-white/10 hover:text-zinc-100',
+        className,
+      )}
+      title={copied ? 'Copied' : 'Copy'}
+    >
+      {copied ? <Check className="h-3 w-3 text-emerald-300" /> : <Copy className="h-3 w-3" />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
   )
 }
 
@@ -948,7 +976,10 @@ export function HomePage() {
                       key={message.id}
                       initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
-                      className={cn('flex gap-4', message.role === 'assistant' ? 'justify-start' : 'justify-end')}
+                      className={cn(
+                        'group flex gap-4',
+                        message.role === 'assistant' ? 'justify-start' : 'justify-end',
+                      )}
                     >
                       {message.role === 'assistant' ? (
                         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-blue-500/15 text-blue-200">
@@ -961,6 +992,12 @@ export function HomePage() {
                           <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
                             <Bot className="h-3.5 w-3.5" />
                             <span className="font-medium text-zinc-300">Nimbus</span>
+                            {message.content && message.status !== 'streaming' ? (
+                              <CopyButton
+                                text={message.content}
+                                className="ml-auto opacity-0 transition group-hover:opacity-100"
+                              />
+                            ) : null}
                           </div>
                         ) : null}
 
@@ -989,6 +1026,10 @@ export function HomePage() {
                         ) : (
                           <div className="rounded-[24px] bg-blue-500 px-5 py-3.5 text-sm leading-7 text-white shadow-xl">
                             <div className="mb-1.5 flex items-center justify-end gap-2 text-xs opacity-80">
+                              <CopyButton
+                                text={message.content}
+                                className="border-white/20 bg-white/10 text-white/90 opacity-0 transition hover:bg-white/20 hover:text-white group-hover:opacity-100"
+                              />
                               <User className="h-3.5 w-3.5" />
                               <span>You</span>
                             </div>
