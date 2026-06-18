@@ -1,4 +1,3 @@
-import type { SendMessageRequest, StreamResponse } from '@a2a-js/sdk'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -33,8 +32,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { getOrchestratorClient } from '@/lib/a2a'
-import { messageToText, streamEventType, taskStateLabel } from '@/lib/a2a-helpers'
+import { streamChat, type ChatStreamEvent } from '@/lib/chat-stream'
 import { env } from '@/lib/env'
 import {
   listSpecialists,
@@ -361,7 +359,6 @@ export function HomePage() {
 
     async function bootstrap() {
       try {
-        await getOrchestratorClient()
         const registry = await listSpecialists(env.orchestratorBaseUrl)
         if (!cancelled) {
           setSpecialists(registry)
@@ -370,7 +367,7 @@ export function HomePage() {
       } catch (error) {
         if (!cancelled) {
           setClientStatus('error')
-          setClientError(error instanceof Error ? error.message : 'Failed to initialize orchestrator client.')
+          setClientError(error instanceof Error ? error.message : 'Failed to reach the orchestrator.')
         }
       }
     }
@@ -519,43 +516,14 @@ export function HomePage() {
     )
 
     try {
-      const client = await getOrchestratorClient()
-      const request: SendMessageRequest = {
-        message: {
-          messageId: uuidv4(),
-          role: 1,
-          contextId,
-          taskId: '',
-          metadata: undefined,
-          extensions: [],
-          referenceTaskIds: [],
-          parts: [
-            {
-              content: {
-                $case: 'text',
-                value: content,
-              },
-              metadata: undefined,
-              filename: '',
-              mediaType: 'text/plain',
-            },
-          ],
-        },
-        configuration: undefined,
-        metadata: undefined,
-        tenant: '',
-      }
-
-      const stream = client.sendMessageStream(request)
-
-      for await (const event of stream) {
+      for await (const event of streamChat(env.orchestratorBaseUrl, content, contextId)) {
         processStreamEvent(event)
       }
 
       updateLastAssistant((message) => ({
         ...message,
         status: 'done',
-        phase: message.phase === 'streaming' ? 'done' : message.phase ?? 'done',
+        phase: message.phase === 'error' ? 'error' : message.phase === 'streaming' ? 'done' : message.phase ?? 'done',
       }))
     } catch (error) {
       pushEvent({
@@ -577,88 +545,139 @@ export function HomePage() {
     }
   }
 
-  function processStreamEvent(event: StreamResponse) {
-    const kind = streamEventType(event)
+  function processStreamEvent(event: ChatStreamEvent) {
+    switch (event.type) {
+      case 'status': {
+        const phase = event.phase
+        const text = event.text || ''
+        const specialistName = event.specialist_name
+        const specs = event.specialists ?? []
 
-    if (kind === 'task' && event.payload?.$case === 'task') {
-      updateLastAssistant((message) => ({ ...message, phase: 'analyzing' }))
-      pushEvent({
-        kind: 'task',
-        icon: 'task',
-        label: 'Task created',
-        detail: `Task ${event.payload.value.id.slice(0, 8)} is ${taskStateLabel(event.payload.value.status?.state)}.`,
-      })
-      return
-    }
+        if (phase === 'routing') {
+          updateLastAssistant((message) => ({ ...message, phase: 'analyzing' }))
+          pushEvent({ kind: 'status', icon: 'status', label: 'Analyzing', detail: text })
+          return
+        }
 
-    if (kind === 'statusUpdate' && event.payload?.$case === 'statusUpdate') {
-      const status = event.payload.value.status
-      const detail = messageToText(status?.message) || 'Status changed.'
-      const label = taskStateLabel(status?.state)
-      const isRoute = /routing to specialist/i.test(detail)
-      const isSpecialist = /is working|specialist update|specialist completed|completed the response/i.test(detail)
-      const isCompleted = status?.state === 3
+        if (phase === 'route_decision') {
+          const count = specs.length
+          updateLastAssistant((message) => ({
+            ...message,
+            phase: count === 0 ? 'analyzing' : 'routing',
+            specialistName: count === 1 ? specs[0]?.name : message.specialistName,
+          }))
+          pushEvent({
+            kind: 'route',
+            icon: 'route',
+            label: count === 0 ? 'Direct response' : `Routed to ${count} specialist${count === 1 ? '' : 's'}`,
+            detail: text,
+          })
+          return
+        }
 
-      // Extract specialist name from routing detail: "Routing to specialist 'Name'. Reason: ..."
-      const routeMatch = detail.match(/specialist [''](.+?)['']/i)
-      const specialistName = routeMatch?.[1]
+        if (phase === 'specialist_working') {
+          updateLastAssistant((message) => ({
+            ...message,
+            phase: 'working',
+            specialistName: specialistName ?? message.specialistName,
+          }))
+          pushEvent({
+            kind: 'status',
+            icon: 'search',
+            label: specialistName ? `${specialistName} is working` : 'Specialist working',
+            detail: text,
+          })
+          return
+        }
 
-      updateLastAssistant((message) => ({
-        ...message,
-        phase: isCompleted ? 'done' : isRoute ? 'routing' : isSpecialist ? 'working' : 'analyzing',
-        specialistName: specialistName ?? message.specialistName,
-      }))
-      pushEvent({
-        kind: isRoute ? 'route' : 'status',
-        icon: isRoute ? 'route' : isSpecialist ? 'search' : 'status',
-        label: isRoute && specialistName ? `Routed to ${specialistName}` : label,
-        detail,
-      })
-      return
-    }
+        if (phase === 'specialist_done') {
+          pushEvent({
+            kind: 'message',
+            icon: 'message',
+            label: specialistName ? `${specialistName} completed` : 'Specialist completed',
+            detail: text,
+          })
+          return
+        }
 
-    if (kind === 'artifactUpdate' && event.payload?.$case === 'artifactUpdate') {
-      const artifact = event.payload.value.artifact
-      const token = artifact?.parts
-        ?.map((part) => {
-          if (!part.content) return ''
-          switch (part.content.$case) {
-            case 'text':
-              return part.content.value
-            case 'data':
-              return JSON.stringify(part.content.value)
-            default:
-              return ''
-          }
-        })
-        .join('')
+        // responding / synthesizing / assembling → streaming
+        if (phase === 'responding' || phase === 'synthesizing' || phase === 'assembling') {
+          updateLastAssistant((message) => ({ ...message, phase: 'streaming' }))
+          pushEvent({
+            kind: 'status',
+            icon: 'status',
+            label:
+              phase === 'synthesizing' ? 'Synthesizing' : phase === 'assembling' ? 'Assembling' : 'Responding',
+            detail: text,
+          })
+          return
+        }
 
-      if (token) {
-        updateLastAssistant((message) => ({
-          ...message,
-          phase: 'streaming',
-          content: message.content + token,
-        }))
+        pushEvent({ kind: 'status', icon: 'status', label: 'Status', detail: text })
+        return
       }
-      return
-    }
 
-    if (kind === 'message' && event.payload?.$case === 'message') {
-      const content = messageToText(event.payload.value)
-      if (content) {
+      case 'token': {
+        if (event.text) {
+          updateLastAssistant((message) => ({
+            ...message,
+            phase: 'streaming',
+            content: message.content + event.text,
+          }))
+        }
+        return
+      }
+
+      case 'specialist_chunk': {
         updateLastAssistant((message) => ({
           ...message,
-          content: message.content + content,
+          phase: message.phase === 'streaming' ? message.phase : 'working',
+          specialistName: event.specialist_name ?? message.specialistName,
+          events: [
+            ...(message.events ?? []),
+            {
+              id: uuidv4(),
+              kind: 'artifact' as const,
+              icon: 'artifact' as const,
+              label: `${event.specialist_name} chunk`,
+              detail: event.text.slice(0, 120),
+            },
+          ],
+        }))
+        return
+      }
+
+      case 'done': {
+        updateLastAssistant((message) => ({
+          ...message,
           status: 'done',
           phase: 'done',
+          content: event.final_response || message.content,
         }))
+        pushEvent({
+          kind: 'message',
+          icon: 'message',
+          label: 'Completed',
+          detail: 'Response complete.',
+        })
+        return
       }
-      pushEvent({
-        kind: 'message',
-        icon: 'message',
-        label: 'Final message',
-        detail: content ? 'Final agent message received.' : 'A final agent message arrived.',
-      })
+
+      case 'error': {
+        updateLastAssistant((message) => ({
+          ...message,
+          status: 'done',
+          phase: 'error',
+          content: message.content || event.text || 'An error occurred.',
+        }))
+        pushEvent({
+          kind: 'status',
+          icon: 'status',
+          label: 'Error',
+          detail: event.text,
+        })
+        return
+      }
     }
   }
 
