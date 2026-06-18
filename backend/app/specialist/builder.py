@@ -274,7 +274,7 @@ def build_specialist_agent_card(settings: Settings, config: SpecialistConfig) ->
         ),
         capabilities=AgentCapabilities(
             streaming=True,
-            push_notifications=False,
+            push_notifications=True,
             extended_agent_card=False,
         ),
         default_input_modes=['text/plain'],

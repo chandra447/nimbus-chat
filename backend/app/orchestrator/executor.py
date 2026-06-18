@@ -9,15 +9,26 @@ from a2a.helpers import new_task_from_user_message
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.server.tasks.task_updater import TaskUpdater
-from a2a.types.a2a_pb2 import Message, Part, Role, SendMessageRequest, TaskState
+from a2a.types.a2a_pb2 import (
+    Message,
+    Part,
+    Role,
+    SendMessageConfiguration,
+    SendMessageRequest,
+    StreamResponse,
+    TaskPushNotificationConfig,
+    TaskState,
+)
 from langchain_core.messages import AIMessage, HumanMessage
 
+from app.orchestrator.callback import callback_manager
 from app.orchestrator.registry import SpecialistRegistry
 from app.orchestrator.routing import (
     OrchestratorResponder,
     OrchestratorRouter,
     OrchestratorSynthesizer,
 )
+from app.settings import Settings
 
 
 def agent_message(
@@ -37,11 +48,13 @@ def agent_message(
 class OrchestratorExecutor(AgentExecutor):
     def __init__(
         self,
+        settings: Settings,
         registry: SpecialistRegistry,
         router: OrchestratorRouter,
         responder: OrchestratorResponder,
         synthesizer: OrchestratorSynthesizer,
     ) -> None:
+        self.settings = settings
         self.registry = registry
         self.router = router
         self.responder = responder
@@ -172,7 +185,186 @@ class OrchestratorExecutor(AgentExecutor):
         context_id: str,
         updater: TaskUpdater,
     ) -> tuple[str, str]:
-        """Call one specialist, emit status updates, return (name, full_response)."""
+        """Call one specialist, emit status updates, return (name, full_response).
+
+        When ``async_specialist_mode`` is enabled, uses ``return_immediately=True``
+        with push notifications — the specialist processes in the background and
+        POSTs events to the orchestrator's webhook. No long-held A2A connection.
+        """
+        if self.settings.async_specialist_mode:
+            return await self._call_specialist_async(
+                specialist_name=specialist_name,
+                specialist_url=specialist_url,
+                user_input=user_input,
+                task_id=task_id,
+                context_id=context_id,
+                updater=updater,
+            )
+        return await self._call_specialist_streaming(
+                specialist_name=specialist_name,
+                specialist_url=specialist_url,
+                user_input=user_input,
+                task_id=task_id,
+                context_id=context_id,
+                updater=updater,
+            )
+
+    async def _call_specialist_async(
+        self,
+        *,
+        specialist_name: str,
+        specialist_url: str,
+        user_input: str,
+        task_id: str,
+        context_id: str,
+        updater: TaskUpdater,
+    ) -> tuple[str, str]:
+        """Call a specialist with return_immediately + push notifications.
+
+        1. Register a callback queue keyed by a unique token.
+        2. Send ``SendMessage`` (non-streaming) with ``return_immediately=True``
+           and a push-notification config pointing to the orchestrator webhook.
+        3. The specialist returns immediately with the initial Task.
+        4. The specialist processes in the background and POSTs events
+           (status updates, artifact chunks) to ``/a2a/callback``.
+        5. We consume events from the callback queue and relay them.
+        """
+        callback_token = f'nimbus-{uuid4()}'
+        callback_url = f'{self.settings.orchestrator_internal_url}/a2a/callback'
+        queue = callback_manager.create_queue(callback_token)
+
+        try:
+            # Non-streaming client — uses JSON-RPC ``SendMessage`` (not SSE).
+            specialist_config = ClientConfig(
+                streaming=False,
+                httpx_client=httpx.AsyncClient(timeout=300.0),
+            )
+            client = await create_client(
+                specialist_url, client_config=specialist_config
+            )
+
+            request = SendMessageRequest(
+                message=Message(
+                    message_id=str(uuid4()),
+                    role=Role.ROLE_USER,
+                    context_id=context_id,
+                    parts=[Part(text=user_input)],
+                ),
+                configuration=SendMessageConfiguration(
+                    return_immediately=True,
+                    task_push_notification_config=TaskPushNotificationConfig(
+                        url=callback_url,
+                        token=callback_token,
+                    ),
+                ),
+            )
+
+            # send_message with streaming=False yields one StreamResponse
+            # (the initial Task) and returns. The specialist continues
+            # in the background.
+            async for event in client.send_message(request):
+                if event.HasField('task'):
+                    state_name = TaskState.Name(event.task.status.state)
+                    await updater.update_status(
+                        TaskState.TASK_STATE_WORKING,
+                        message=agent_message(
+                            task_id=task_id,
+                            context_id=context_id,
+                            text=f'{specialist_name} received the request ({state_name.lower()}).',
+                        ),
+                        metadata={'specialist_name': specialist_name, 'async': True},
+                    )
+
+            # Now consume push-notification events from the webhook queue.
+            response_chunks: list[str] = []
+            while True:
+                try:
+                    push_event: StreamResponse = await asyncio.wait_for(
+                        queue.get(), timeout=300.0
+                    )
+                except asyncio.TimeoutError:
+                    await updater.update_status(
+                        TaskState.TASK_STATE_WORKING,
+                        message=agent_message(
+                            task_id=task_id,
+                            context_id=context_id,
+                            text=f'{specialist_name} timed out.',
+                        ),
+                    )
+                    break
+
+                if push_event.HasField('status_update'):
+                    status = push_event.status_update.status
+                    state = status.state
+                    state_name = TaskState.Name(state)
+                    msg_text = ''
+                    if status.message and status.message.parts:
+                        for p in status.message.parts:
+                            if p.HasField('text'):
+                                msg_text = p.text
+                    await updater.update_status(
+                        TaskState.TASK_STATE_WORKING,
+                        message=agent_message(
+                            task_id=task_id,
+                            context_id=context_id,
+                            text=f'{specialist_name} is working… ({state_name.lower()})',
+                        ),
+                        metadata={'specialist_name': specialist_name, 'specialist_state': state_name},
+                    )
+                    # Terminal state — specialist is done.
+                    if state in (
+                        TaskState.TASK_STATE_COMPLETED,
+                        TaskState.TASK_STATE_FAILED,
+                        TaskState.TASK_STATE_CANCELED,
+                        TaskState.TASK_STATE_REJECTED,
+                    ):
+                        break
+
+                elif push_event.HasField('artifact_update'):
+                    for part in push_event.artifact_update.artifact.parts:
+                        if part.HasField('text'):
+                            response_chunks.append(part.text)
+
+                elif push_event.HasField('message'):
+                    for part in push_event.message.parts:
+                        if part.HasField('text'):
+                            response_chunks.append(part.text)
+                    break  # Message is terminal.
+
+                elif push_event.HasField('task'):
+                    state = push_event.task.status.state
+                    if state in (
+                        TaskState.TASK_STATE_COMPLETED,
+                        TaskState.TASK_STATE_FAILED,
+                        TaskState.TASK_STATE_CANCELED,
+                        TaskState.TASK_STATE_REJECTED,
+                    ):
+                        break
+
+            await updater.update_status(
+                TaskState.TASK_STATE_WORKING,
+                message=agent_message(
+                    task_id=task_id,
+                    context_id=context_id,
+                    text=f'{specialist_name} completed its response.',
+                ),
+                metadata={'specialist_name': specialist_name, 'specialist_done': True},
+            )
+            return specialist_name, ''.join(response_chunks)
+        finally:
+            callback_manager.remove_queue(callback_token)
+
+    async def _call_specialist_streaming(
+        self,
+        *,
+        specialist_name: str,
+        specialist_url: str,
+        user_input: str,
+        task_id: str,
+        context_id: str,
+        updater: TaskUpdater,
+    ) -> tuple[str, str]:
+        """Call one specialist via streaming SSE (legacy synchronous mode)."""
         specialist_config = ClientConfig(
             httpx_client=httpx.AsyncClient(timeout=300.0)
         )

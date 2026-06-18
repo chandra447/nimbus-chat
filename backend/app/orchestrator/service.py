@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from google.protobuf.json_format import ParseDict
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -15,10 +16,12 @@ from a2a.server.tasks import (
     DatabasePushNotificationConfigStore,
     DatabaseTaskStore,
 )
+from a2a.types.a2a_pb2 import StreamResponse
 
 from app.checkpointing import create_sqlite_checkpointer
 from app.orchestrator.agent_card import build_orchestrator_agent_card
 from app.orchestrator.api import router as orchestrator_router
+from app.orchestrator.callback import callback_manager
 from app.orchestrator.executor import OrchestratorExecutor
 from app.orchestrator.middleware import RegisteredSpecialistPromptMiddleware
 from app.orchestrator.registry import SpecialistRegistry
@@ -46,7 +49,7 @@ def create_orchestrator_app(settings: Settings) -> FastAPI:
         router = OrchestratorRouter(settings, registry, checkpointer=checkpointer)
         responder = OrchestratorResponder(settings, checkpointer=checkpointer)
         synthesizer = OrchestratorSynthesizer(settings, checkpointer=checkpointer)
-        executor = OrchestratorExecutor(registry, router, responder, synthesizer)
+        executor = OrchestratorExecutor(settings, registry, router, responder, synthesizer)
         request_handler = DefaultRequestHandler(
             agent_executor=executor,
             task_store=task_store,
@@ -108,7 +111,25 @@ def create_orchestrator_app(settings: Settings) -> FastAPI:
             'tavily_configured': settings.tavily_configured,
             'specialist_card_refresh_ttl_seconds': settings.specialist_card_refresh_ttl_seconds,
             'orchestrator_agent_card_name': agent_card.name,
+            'async_specialist_mode': settings.async_specialist_mode,
         }
+
+    # ------------------------------------------------------------------
+    # A2A Push-Notification Webhook
+    # ------------------------------------------------------------------
+    # When async_specialist_mode is enabled, specialists POST task events
+    # (status updates, artifact chunks) to this endpoint. The CallbackManager
+    # routes them to the corresponding executor's asyncio.Queue.
+    #
+    # The body is a JSON-serialised StreamResponse proto. The token in the
+    # X-A2A-Notification-Token header identifies which callback queue to use.
+    @app.post('/a2a/callback')
+    async def specialist_push_notification(request: Request) -> dict[str, str]:
+        token = request.headers.get('X-A2A-Notification-Token', '')
+        body = await request.json()
+        stream_response = ParseDict(body, StreamResponse())
+        await callback_manager.push_event(token, stream_response)
+        return {'status': 'ok'}
 
     @app.get('/api/orchestrator/agent-card')
     def orchestrator_agent_card_preview() -> dict[str, object]:

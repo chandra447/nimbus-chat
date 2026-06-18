@@ -18,6 +18,8 @@ services:
       SPECIALIST_PUBLIC_URL: http://localhost:8001
       SPECIALIST_INTERNAL_URL: http://travel-specialist:8001
       SPECIALIST_URL_REMAPS: http://localhost:8001=http://travel-specialist:8001,http://localhost:8002=http://nutrition-specialist:8002
+      ORCHESTRATOR_INTERNAL_URL: http://orchestrator:8000
+      ASYNC_SPECIALIST_MODE: ${ASYNC_SPECIALIST_MODE:-true}
       TAVILY_ENABLED: ${TAVILY_ENABLED:-true}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       SPECIALIST_CARD_REFRESH_TTL_SECONDS: ${SPECIALIST_CARD_REFRESH_TTL_SECONDS:-300}

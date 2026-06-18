@@ -15,6 +15,9 @@ from a2a.server.tasks import (
     DatabasePushNotificationConfigStore,
     DatabaseTaskStore,
 )
+from a2a.server.tasks.base_push_notification_sender import (
+    BasePushNotificationSender,
+)
 
 from app.checkpointing import create_sqlite_checkpointer
 from app.settings import Settings
@@ -45,11 +48,17 @@ def create_specialist_app(
 
         checkpointer_conn, checkpointer = await create_sqlite_checkpointer(settings)
         executor = GenericSpecialistExecutor(settings, config, checkpointer=checkpointer)
+        import httpx
+        push_sender = BasePushNotificationSender(
+            httpx_client=httpx.AsyncClient(timeout=30.0),
+            config_store=push_config_store,
+        )
         request_handler = DefaultRequestHandler(
             agent_executor=executor,
             task_store=task_store,
             agent_card=agent_card,
             push_config_store=push_config_store,
+            push_sender=push_sender,
         )
 
         app.state.specialist_agent_card = agent_card

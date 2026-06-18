@@ -82,6 +82,23 @@ class Settings(BaseSettings):
             'Use * to allow all origins (development only).'
         ),
     )
+    async_specialist_mode: bool = Field(
+        default=True,
+        alias='ASYNC_SPECIALIST_MODE',
+        description=(
+            'When True, the orchestrator uses return_immediately + push '
+            'notifications to communicate with specialists (no held A2A SSE). '
+            'When False, uses traditional streaming SSE connections.'
+        ),
+    )
+    orchestrator_internal_url: str = Field(
+        default='http://localhost:8000',
+        alias='ORCHESTRATOR_INTERNAL_URL',
+        description=(
+            'Internal URL that specialists use to POST push notifications '
+            'back to the orchestrator. In Docker, use the service hostname.'
+        ),
+    )
 
     @computed_field
     @property
