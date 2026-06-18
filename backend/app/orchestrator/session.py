@@ -52,7 +52,11 @@ from langgraph.types import Command
 
 from app.orchestrator.routing import OrchestratorResponder
 from app.settings import Settings
-from app.tracing import get_tracer, session_id_for
+from app.tracing import (
+    attach_session_to_context,
+    get_tracer,
+    session_id_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,20 +121,67 @@ class GraphSession:
     def _trace_context(self):
         """Context manager wrapping the whole turn in one HoneyHive span.
 
-        Sets the conversation session_id in the OTel baggage so that every
-        child span (router, responder, synthesizer, and the specialist
-        dispatch) lands in the same HoneyHive session. Returns a no-op context
-        manager when tracing is disabled.
+        Creates the ``orchestrator_turn`` span and attaches the conversation
+        session_id into the OTel baggage. The baggage is what the HoneyHive
+        span processor reads (key ``honeyhive.session_id``) to stamp every
+        child LangChain span, and what ``inject_context_into_carrier``
+        propagates to specialists — so without it the orchestrator's own
+        router/responder/synthesizer spans and the specialist spans would all
+        drift into separate sessions. Returns a no-op context manager when
+        tracing is disabled.
+        """
+        if self.tracer is None:
+            from contextlib import contextmanager, nullcontext
+
+            @contextmanager
+            def _noop():
+                yield
+
+            return _noop()
+        from contextlib import contextmanager
+
+        from honeyhive.tracer.processing.context import enrich_span_context
+
+        @contextmanager
+        def _cm():
+            with enrich_span_context(
+                event_name='orchestrator_turn',
+                inputs={
+                    'user_input': self.user_input,
+                    'context_id': self.context_id,
+                },
+                session_id=self.session_id,
+                tracer_instance=self.tracer,
+            ):
+                # Put the session into baggage so child spans + outbound A2A
+                # requests carry it (enrich_span_context only sets an attr).
+                with attach_session_to_context(self.session_id):
+                    yield
+
+        return _cm()
+
+    def _callback_trace_context(self, request):
+        """Attach the push-notification's trace context to webhook handling.
+
+        Specialists inject the W3C traceparent + HoneyHive session baggage
+        into the callback POST headers (see the SDK's tracing push sender).
+        Extracting it here makes the graph-resume processing (relaying chunks,
+        resuming the interrupt) part of the same trace + session as the
+        original orchestrator turn. ``session_id`` is passed explicitly as a
+        safety net so the resume always lands in the right session even if a
+        specialist's header injection is missing. No-op when tracing is off.
         """
         if self.tracer is None:
             from contextlib import nullcontext
+
             return nullcontext()
-        from honeyhive.tracer.processing.context import enrich_span_context
-        return enrich_span_context(
-            event_name='orchestrator_turn',
-            inputs={'user_input': self.user_input, 'context_id': self.context_id},
-            session_id=self.session_id,
-            tracer_instance=self.tracer,
+        from honeyhive.tracer.processing.context import (
+            with_distributed_trace_context,
+        )
+
+        headers = {k: v for k, v in request.headers.items()}
+        return with_distributed_trace_context(
+            headers, self.tracer, session_id=self.session_id
         )
 
     async def _drive(self) -> None:
@@ -245,13 +296,20 @@ class GraphSession:
 
         ``ClientCallContext.service_parameters`` becomes the HTTP headers on
         the outgoing JSON-RPC request, so the specialist can extract the W3C
-        traceparent + HoneyHive session baggage.
+        traceparent + HoneyHive session baggage. The session_id is already in
+        the current baggage (attached by ``_trace_context``), so injection
+        carries it across the A2A boundary.
         """
         if self.tracer is None:
             return None
-        from honeyhive.tracer.processing.context import inject_context_into_carrier
+        from app.tracing import inject_trace_context_into_headers
+
         headers: dict[str, str] = {}
-        inject_context_into_carrier(headers, self.tracer)
+        # Ensure the session is in baggage even if this background task did
+        # not inherit the driver's context (defensive; asyncio.create_task
+        # normally copies it, but the inject must always carry the session).
+        with attach_session_to_context(self.session_id):
+            inject_trace_context_into_headers(headers, self.tracer)
         if not headers:
             return None
         return ClientCallContext(service_parameters=headers)

@@ -30,7 +30,8 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,68 @@ def _suppress_known_callback_errors() -> None:
     ERROR level so the noise stays out of the logs.
     """
     logging.getLogger('langchain_core.callbacks.manager').setLevel(logging.ERROR)
+
+
+@contextmanager
+def attach_session_to_context(session_id: str) -> Iterator[None]:
+    """Attach the HoneyHive session_id into the current OTel baggage.
+
+    HoneyHive's ``enrich_span_context(session_id=...)`` sets the session_id as
+    a span *attribute* on the span it creates, but it does **not** put it into
+    the OTel baggage. The HoneyHive span processor
+    (``honeyhive/tracer/core/operations.py``) stamps every child span's
+    ``honeyhive.session_id`` attribute by reading the baggage key
+    ``honeyhive.session_id`` — and ``inject_context_into_carrier`` only
+    propagates baggage, not span attributes. So without explicitly placing the
+    session in baggage:
+
+    1. The orchestrator's own child LangChain spans (router / responder /
+       synthesizer) are not stamped with the session → they drift into a
+       separate session.
+    2. ``inject_context_into_carrier`` omits the session from the baggage
+       header → the specialist never receives it → specialist spans land in a
+       separate session.
+
+    This helper puts both ``session_id`` (read by HoneyHive's dynamic
+    enrichment helper) and ``honeyhive.session_id`` (read by the span
+    processor) into the current baggage so the session propagates to all
+    child spans **and** across the A2A boundary via injected headers. Call it
+    inside an ``enrich_span_context`` block.
+    """
+    from opentelemetry import baggage, context as otel_context
+
+    ctx = otel_context.get_current()
+    ctx = baggage.set_baggage('session_id', session_id, ctx)
+    ctx = baggage.set_baggage('honeyhive.session_id', session_id, ctx)
+    token = otel_context.attach(ctx)
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+def inject_trace_context_into_headers(
+    headers: dict[str, str], tracer: Any
+) -> bool:
+    """Inject the current W3C trace context + HoneyHive baggage into ``headers``.
+
+    Thin wrapper around HoneyHive's ``inject_context_into_carrier`` used by the
+    push-notification sender (and any other outbound callback) so the receiver
+    can attach its processing to the same trace + session. Returns ``True`` if
+    injection produced any headers, ``False`` if tracing is inactive.
+    """
+    if tracer is None:
+        return False
+    try:
+        from honeyhive.tracer.processing.context import (
+            inject_context_into_carrier,
+        )
+
+        before = len(headers)
+        inject_context_into_carrier(headers, tracer)
+        return len(headers) > before
+    except Exception:  # noqa: BLE001 - never let tracing break the callback
+        return False
 
 
 def shutdown_tracers() -> None:

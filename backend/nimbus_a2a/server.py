@@ -19,6 +19,7 @@ Everything an app needs to spin up a specialist is: an executor, a card, and a
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -35,11 +36,16 @@ from a2a.server.tasks import (
 from a2a.server.tasks.base_push_notification_sender import (
     BasePushNotificationSender,
 )
+from a2a.types.a2a_pb2 import TaskPushNotificationConfig
+from a2a.utils.proto_utils import to_stream_response
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from google.protobuf.json_format import MessageToDict
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from nimbus_a2a.executor import SpecialistExecutor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,9 +101,10 @@ def create_specialist_app(
         await push_config_store.initialize()
         await executor.startup()
 
-        push_sender = BasePushNotificationSender(
+        push_sender = _TracingPushNotificationSender(
             httpx_client=httpx.AsyncClient(timeout=30.0),
             config_store=push_config_store,
+            tracer=tracer,
         )
         request_handler = DefaultRequestHandler(
             agent_executor=executor,
@@ -201,3 +208,67 @@ def _add_distributed_trace_middleware(app: FastAPI, tracer) -> None:
         headers = {k: v for k, v in request.headers.items()}
         with with_distributed_trace_context(headers, tracer):
             return await call_next(request)
+
+
+class _TracingPushNotificationSender(BasePushNotificationSender):
+    """Push sender that propagates the trace context in callback headers.
+
+    The A2A request handler dispatches push notifications from a producer task
+    that inherits the OTel context attached by the trace middleware (the
+    session_id + traceparent extracted from the orchestrator's original A2A
+    request). By injecting that context into the callback POST headers, the
+    orchestrator's ``/a2a/callback`` webhook can attach its resume processing
+    (relaying chunks, resuming the graph interrupt) to the same trace +
+    session as the original orchestrator turn — closing the loop on the
+    push-notification/callback pattern. Without this, the callback lands in a
+    separate trace.
+
+    Falls back to plain behaviour (no extra headers) when tracing is inactive.
+    """
+
+    def __init__(self, httpx_client, config_store, tracer) -> None:
+        super().__init__(httpx_client=httpx_client, config_store=config_store)
+        self._tracer = tracer
+
+    async def _dispatch_notification(
+        self,
+        event,
+        push_info: TaskPushNotificationConfig,
+        task_id: str,
+    ) -> bool:
+        url = push_info.url
+        try:
+            headers = {}
+            if push_info.token:
+                headers['X-A2A-Notification-Token'] = push_info.token
+            # Inject W3C traceparent + HoneyHive session baggage so the
+            # orchestrator's webhook resumes within the same trace + session.
+            if self._tracer is not None:
+                try:
+                    from honeyhive.tracer.processing.context import (
+                        inject_context_into_carrier,
+                    )
+
+                    inject_context_into_carrier(headers, self._tracer)
+                except Exception:  # noqa: BLE001 - never break the callback
+                    logger.debug(
+                        'Failed to inject trace context into push notification',
+                        exc_info=True,
+                    )
+            response = await self._client.post(
+                url,
+                json=MessageToDict(to_stream_response(event)),
+                headers=headers,
+            )
+            response.raise_for_status()
+            logger.info(
+                'Push-notification sent for task_id=%s to URL: %s', task_id, url
+            )
+        except Exception:
+            logger.exception(
+                'Error sending push-notification for task_id=%s to URL: %s.',
+                task_id,
+                url,
+            )
+            return False
+        return True

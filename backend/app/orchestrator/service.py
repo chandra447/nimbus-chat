@@ -154,7 +154,12 @@ def create_orchestrator_app(settings: Settings) -> FastAPI:
         session = session_registry.get_by_token(token)
         if session is None:
             return {'status': 'unknown_token'}
-        await session.handle_push_event(token, stream_response)
+        # Extract the W3C trace context + HoneyHive session the specialist
+        # injected into the callback headers, so relaying chunks + resuming
+        # the graph interrupt lands in the same trace + session as the
+        # original orchestrator turn.
+        with session._callback_trace_context(request):
+            await session.handle_push_event(token, stream_response)
         return {'status': 'ok'}
 
     # ------------------------------------------------------------------

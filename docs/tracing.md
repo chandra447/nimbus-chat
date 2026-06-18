@@ -42,12 +42,18 @@ single per-conversation session with a true parent-child trace tree.
 ## Context propagation
 
 The orchestrator → specialist trace link uses HoneyHive's distributed-tracing
-helpers:
+helpers. **Crucially, the session_id must be placed in the OTel baggage** —
+`enrich_span_context(session_id=...)` only sets it as a span *attribute*, but
+the HoneyHive span processor stamps every child span by reading the baggage
+key `honeyhive.session_id`. `app/tracing.attach_session_to_context()` does
+this so the session propagates to child spans *and* across the A2A boundary.
 
 | Side | Helper | What it does |
 |------|--------|--------------|
-| **Orchestrator** (client) | `enrich_span_context("call_specialist")` + `inject_context_into_carrier(headers, tracer)` | Wraps the A2A dispatch in a span and injects the W3C `traceparent` + session/project `baggage` into the outgoing A2A request headers (via `ClientCallContext.service_parameters`). |
-| **Specialist** (server) | `with_distributed_trace_context(headers, tracer)` | A FastAPI middleware extracts the incoming trace context and attaches it as the current OTel context — so all LangChain spans created while handling the request become **children** of the orchestrator's `call_specialist` span, in the **same session**. |
+| **Orchestrator** (client) | `enrich_span_context("orchestrator_turn")` + `attach_session_to_context()`` + `inject_context_into_carrier(headers, tracer)` | Wraps the turn in a span, puts `session_id` + `honeyhive.session_id` into baggage (so the orchestrator's own router/responder/synthesizer spans are stamped), and injects the W3C `traceparent` + session baggage into the outgoing A2A request headers (via `ClientCallContext.service_parameters`). |
+| **Specialist** (server, receive) | `with_distributed_trace_context(headers, tracer)` | A FastAPI middleware extracts the incoming trace context + baggage and attaches it — so all LangChain spans created while handling the request become **children** of the orchestrator's `call_specialist` span, in the **same session**. |
+| **Specialist** (server, push back) | `_TracingPushNotificationSender` | Subclass of `BasePushNotificationSender` that injects the current trace context into the callback POST headers. The push-notification producer task inherits the baggage from the receive middleware, so the callback carries the session back. |
+| **Orchestrator** (webhook, receive) | `with_distributed_trace_context(headers, tracer, session_id=...)` | The `/a2a/callback` webhook extracts the context the specialist injected, so relaying chunks + resuming the graph interrupt lands in the same trace + session. |
 
 ## Configuration
 
@@ -78,9 +84,10 @@ under your project. Each conversation's session ID is
 
 | File | Responsibility |
 |------|----------------|
-| `backend/app/tracing.py` | Tracer init (one per service), LangChain instrumentation, A2A tracing disable, session-ID derivation, known-error suppression. |
-| `backend/app/orchestrator/session.py` | `GraphSession` wraps each turn in `enrich_span_context(session_id=…)` and injects trace context into the A2A dispatch headers. |
-| `backend/nimbus_a2a/server.py` | `create_specialist_app(…, tracer=…)` adds a FastAPI middleware that calls `with_distributed_trace_context(headers, tracer)` so specialist spans link to the caller. |
+| `backend/app/tracing.py` | Tracer init (one per service), LangChain instrumentation, A2A tracing disable, session-ID derivation, `attach_session_to_context()` (baggage propagation), `inject_trace_context_into_headers()`, known-error suppression. |
+| `backend/app/orchestrator/session.py` | `GraphSession` wraps each turn in `enrich_span_context` + `attach_session_to_context` (session in baggage), injects trace context into the A2A dispatch headers, and exposes `_callback_trace_context()` for the webhook to extract the specialist's callback context. |
+| `backend/nimbus_a2a/server.py` | `create_specialist_app(…, tracer=…)` adds a FastAPI middleware that calls `with_distributed_trace_context(headers, tracer)` so specialist spans link to the caller, and uses `_TracingPushNotificationSender` to inject trace context into callback POSTs. |
+| `backend/app/orchestrator/service.py` | The `/a2a/callback` webhook wraps handling in `session._callback_trace_context(request)` so resume processing joins the original trace + session. |
 | `backend/app/specialist/service.py` | Passes `get_tracer(f'specialist:{prefix}')` into the SDK. |
 
 ## For SDK teams (specialist authors)
@@ -106,7 +113,9 @@ app = create_specialist_app(
 
 The SDK handles the rest: incoming A2A requests are wrapped in
 `with_distributed_trace_context`, so your specialist's spans automatically link
-to the orchestrator's trace and land in the same HoneyHive session.
+to the orchestrator's trace and land in the same HoneyHive session. The
+push-notification sender also injects the trace context into callback POSTs,
+so the orchestrator's webhook resume processing joins the same trace.
 
 ## Known issues
 
