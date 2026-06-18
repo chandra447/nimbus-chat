@@ -55,6 +55,7 @@ from app.settings import Settings
 from app.tracing import (
     attach_session_to_context,
     get_tracer,
+    register_session_with_honeyhive,
     session_id_for,
 )
 
@@ -121,7 +122,8 @@ class GraphSession:
     def _trace_context(self):
         """Context manager wrapping the whole turn in one HoneyHive span.
 
-        Creates the ``orchestrator_turn`` span and attaches the conversation
+        Registers the deterministic per-conversation session with HoneyHive,
+        creates the ``orchestrator_turn`` span, and attaches the conversation
         session_id into the OTel baggage. The baggage is what the HoneyHive
         span processor reads (key ``honeyhive.session_id``) to stamp every
         child LangChain span, and what ``inject_context_into_carrier``
@@ -144,18 +146,39 @@ class GraphSession:
 
         @contextmanager
         def _cm():
-            with enrich_span_context(
-                event_name='orchestrator_turn',
+            # Create/register the HoneyHive session root event before any child
+            # spans end. This is intentionally orchestrator-only: specialists
+            # receive the already-registered session via distributed baggage.
+            register_session_with_honeyhive(
+                self.tracer,
+                session_id=self.session_id,
+                session_name=f'nimbus-{self.context_id}',
                 inputs={
                     'user_input': self.user_input,
                     'context_id': self.context_id,
                 },
-                session_id=self.session_id,
-                tracer_instance=self.tracer,
-            ):
-                # Put the session into baggage so child spans + outbound A2A
-                # requests carry it (enrich_span_context only sets an attr).
-                with attach_session_to_context(self.session_id):
+                metadata={'component': 'orchestrator'},
+            )
+            # Attach the session to baggage OUTSIDE the span so the baggage is
+            # still present when the span ENDS. The HoneyHive span processor
+            # stamps honeyhive.session_id by reading the baggage at span-end
+            # (operations.py); if we nested attach INSIDE enrich_span_context,
+            # the baggage would detach before the span ends and the processor
+            # would fall back to the tracer's default session — splitting
+            # orchestrator_turn into a different session from its children.
+            # HoneyHiveTracer.create_session currently sets the SDK's
+            # request-scoped "session_id" baggage; this helper also sets
+            # "honeyhive.session_id", which the OTLP span processor requires.
+            with attach_session_to_context(self.session_id):
+                with enrich_span_context(
+                    event_name='orchestrator_turn',
+                    inputs={
+                        'user_input': self.user_input,
+                        'context_id': self.context_id,
+                    },
+                    session_id=self.session_id,
+                    tracer_instance=self.tracer,
+                ):
                     yield
 
         return _cm()

@@ -40,6 +40,7 @@ _SESSION_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')  # NAMESP
 
 _tracers: dict[str, Any] = {}  # source -> HoneyHiveTracer (one per service)
 _langchain_instrumented = False
+_registered_sessions: set[str] = set()
 
 
 def session_id_for(context_id: str) -> str:
@@ -97,6 +98,7 @@ def get_tracer(source: str) -> Optional[Any]:
     _instrument_langchain(tracer)
     _disable_a2a_tracing()
     _suppress_known_callback_errors()
+    _maybe_add_debug_exporter(tracer)
     logger.info('HoneyHive tracer initialized (source=%s, project=%s)', source, project or '<inferred>')
     return tracer
 
@@ -126,6 +128,26 @@ def _disable_a2a_tracing() -> None:
     os.environ.setdefault('OTEL_INSTRUMENTATION_A2A_SDK_ENABLED', 'false')
 
 
+def _maybe_add_debug_exporter(tracer: Any) -> None:
+    """When HH_DEBUG=1, print every span to stderr (names + session attr).
+
+    Debug-only: lets us see exactly which spans the server creates and whether
+    they carry ``honeyhive.session_id``. Off by default.
+    """
+    if os.getenv('HH_DEBUG', '').strip().lower() not in ('1', 'true', 'yes'):
+        return
+    import sys
+
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+
+    processor = SimpleSpanProcessor(ConsoleSpanExporter(out=sys.stderr))
+    try:
+        tracer.provider.add_span_processor(processor)
+        logger.info('HH_DEBUG=1: console span exporter attached')
+    except Exception:  # noqa: BLE001
+        logger.warning('Failed to attach debug console exporter', exc_info=True)
+
+
 def _suppress_known_callback_errors() -> None:
     """Silence non-fatal openinference-langchain + LangGraph callback errors.
 
@@ -137,6 +159,70 @@ def _suppress_known_callback_errors() -> None:
     ERROR level so the noise stays out of the logs.
     """
     logging.getLogger('langchain_core.callbacks.manager').setLevel(logging.ERROR)
+
+
+def register_session_with_honeyhive(
+    tracer: Any,
+    *,
+    session_id: str,
+    session_name: str,
+    inputs: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Register a deterministic HoneyHive session and set SDK baggage.
+
+    HoneyHive sessions are root events in the UI. Spans that carry a
+    ``honeyhive.session_id`` but have no registered session event can be
+    exported successfully yet not appear in the Sessions tree. The
+    recommended web-server pattern is therefore:
+
+    1. initialize one tracer per process, then
+    2. call ``create_session()`` per request/conversation to create the
+       backend session event and put the request-scoped ``session_id`` in
+       OpenTelemetry baggage.
+
+    Nimbus uses a deterministic UUID5 for each conversation, so only the
+    first turn in this process should call the HoneyHive sessions API.
+    Later turns call ``create_session(..., skip_api_call=True)`` to link to
+    the already-created session without creating duplicates. If the API call
+    fails, callers still wrap execution in :func:`attach_session_to_context`
+    so spans keep the intended session id and can be recovered once the
+    session exists.
+    """
+    if tracer is None:
+        return False
+
+    skip_api_call = session_id in _registered_sessions
+    try:
+        created_session_id = tracer.create_session(
+            session_name=session_name,
+            session_id=session_id,
+            inputs=inputs,
+            metadata=metadata,
+            skip_api_call=skip_api_call,
+        )
+    except Exception:  # noqa: BLE001 - tracing must never break a turn
+        logger.warning(
+            'Failed to register HoneyHive session %s', session_id, exc_info=True
+        )
+        return False
+
+    if created_session_id:
+        _registered_sessions.add(session_id)
+        if skip_api_call:
+            logger.debug(
+                'HoneyHive session context attached (session_id=%s)', session_id
+            )
+        else:
+            logger.info('HoneyHive session registered (session_id=%s)', session_id)
+        return True
+
+    logger.warning(
+        'HoneyHive create_session returned no session_id for %s; '
+        'continuing with local baggage only',
+        session_id,
+    )
+    return False
 
 
 @contextmanager
@@ -162,8 +248,9 @@ def attach_session_to_context(session_id: str) -> Iterator[None]:
     This helper puts both ``session_id`` (read by HoneyHive's dynamic
     enrichment helper) and ``honeyhive.session_id`` (read by the span
     processor) into the current baggage so the session propagates to all
-    child spans **and** across the A2A boundary via injected headers. Call it
-    inside an ``enrich_span_context`` block.
+    child spans **and** across the A2A boundary via injected headers. Wrap it
+    outside any ``enrich_span_context`` block so the baggage is still present
+    when the span ends and HoneyHive's span processor runs.
     """
     from opentelemetry import baggage, context as otel_context
 
