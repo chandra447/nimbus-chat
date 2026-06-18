@@ -87,17 +87,19 @@ flowchart TD
     StartWork --> Route["await router.decide(user_input)"]
     Route --> Decision{"RouteDecision"}
 
-    Decision -->|should_route=false| Direct["_stream_direct_response<br/>Responder agent streams tokens"]
-    Decision -->|1 specialist| Single["_stream_specialist_response<br/>A2A call to specialist<br/>stream response to client"]
-    Decision -->|2+ specialists| Parallel["_stream_parallel_specialist_response<br/>asyncio.gather all specialists<br/>then synthesize"]
+    Decision -->|should_route=false| Direct["💬 Responder Agent<br/>streams direct response"]
+    Decision -->|1 specialist| Single["🔀 Route to 1 specialist<br/>async push-notification callback"]
+    Decision -->|2+ specialists| FanOut["⚡ Parallel async fan-out<br/>return_immediately + push notifications"]
 
-    Direct --> Record["responder.record_exchange<br/>if needed"]
-    Single --> Record2["responder.record_exchange<br/>inject specialist response"]
-    Parallel --> Record3["responder.record_exchange<br/>inject synthesized response"]
-
-    Record --> Complete["Emit TASK_STATE_COMPLETED"]
-    Record2 --> Complete
-    Record3 --> Complete
+    FanOut --> Collect["📥 Collect responses<br/>from CallbackManager queues"]
+    Collect --> SynthCheck{"needs_synthesis?"}
+    SynthCheck -->|Yes| Synth["🧬 Synthesizer Agent<br/>combines responses<br/>streams unified answer"]
+    SynthCheck -->|No| Sections["📝 Stream each response<br/>with section header<br/>(no extra LLM call)"]
+    Single --> Record["💾 record_exchange<br/>into responder thread"]
+    Synth --> Record
+    Sections --> Record
+    Direct --> Done["✅ Task completed"]
+    Record --> Done
 ```
 
 ### Three LangChain Agents
@@ -106,9 +108,9 @@ The orchestrator runs three separate `create_agent` instances, each with its own
 
 | Agent | Thread ID | Purpose |
 |---|---|---|
-| **Router** | `{contextId}:route` | Structured output — returns `RouteDecision` with specialist list |
+| **Router** | `{contextId}:route` | Structured output — returns `RouteDecision` with specialist list + `needs_synthesis` flag |
 | **Responder** | `{contextId}:respond` | Direct responses when no specialist is needed |
-| **Synthesizer** | `{contextId}:synthesize` | Combines multiple specialist responses into one |
+| **Synthesizer** | `{contextId}:synthesize` | Combines multiple specialist responses into one (only when `needs_synthesis=true`) |
 
 All three share the same SQLite checkpointer, so conversation history persists across restarts.
 
@@ -120,10 +122,50 @@ The router uses `create_agent` with `response_format=RouteDecision` (a Pydantic 
 class RouteDecision(BaseModel):
     should_route: bool
     specialists: list[SpecialistRoute]  # 0, 1, or many
+    needs_synthesis: bool               # only when 2+ specialists
     rationale: str
 ```
 
-The `RegisteredSpecialistPromptMiddleware` injects a formatted list of all registered specialists (with their skills, tags, examples) into the router's system prompt before each call. The router then decides which specialists are relevant.
+The `RegisteredSpecialistPromptMiddleware` injects a formatted list of all registered specialists (with their skills, tags, examples) into the router's system prompt before each call. The router then decides which specialists are relevant and whether their advice overlaps enough to require synthesis.
+
+### Async Push-Notification Pattern
+
+The orchestrator communicates with specialists using the A2A push-notification async pattern (configurable via `ASYNC_SPECIALIST_MODE`):
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant CM as CallbackManager
+    participant S as Specialist
+    participant WH as Webhook /a2a/callback
+
+    O->>CM: create_queue(callback_token)
+    O->>S: SendMessage(return_immediately=true, push_config=url+token)
+    S-->>O: 200 OK (initial Task)
+    Note over S: Specialist works in background
+    Note over O: Orchestrator freed up
+
+    S->>WH: POST /a2a/callback (StreamResponse: status_update WORKING)
+    WH->>CM: push_event(token, event)
+    CM->>O: queue.get() → event
+    O->>O: relay status to client SSE
+
+    S->>WH: POST /a2a/callback (StreamResponse: status_update COMPLETED)
+    WH->>CM: push_event(token, event)
+    CM->>O: queue.get() → terminal event
+    O->>O: break loop, cleanup queue
+```
+
+**How it works:**
+1. The executor generates a unique `callback_token` and creates an `asyncio.Queue` in the `CallbackManager`
+2. It sends a non-streaming `SendMessage` with `return_immediately=True` and a `TaskPushNotificationConfig` containing the orchestrator webhook URL + token
+3. The specialist returns the initial `Task` immediately and continues processing in the background
+4. As the specialist works, the A2A SDK's `BasePushNotificationSender` POSTs `StreamResponse` events to `/a2a/callback`
+5. The webhook parses the event, extracts the token from the `X-A2A-Notification-Token` header, and pushes it into the corresponding `asyncio.Queue`
+6. The executor consumes events from the queue — relaying status updates and collecting artifact chunks
+7. When a terminal state arrives (`COMPLETED`/`FAILED`), the executor finishes and cleans up the queue
+
+**Fallback:** When `ASYNC_SPECIALIST_MODE=false`, the executor uses traditional streaming SSE (`send_message_stream`) — simpler but holds the A2A connection open for the entire specialist execution.
 
 ### Specialist Prompt Middleware
 

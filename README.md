@@ -24,6 +24,7 @@ graph TB
     User["👤 User (Browser)"]
     FE["⚛️ Frontend<br/>React + @a2a-js/sdk<br/>:3000"]
     ORC["🧠 Orchestrator<br/>FastAPI + A2A Server<br/>:8000"]
+    WH["📡 Webhook<br/>POST /a2a/callback"]
     TS["✈️ Travel Specialist<br/>LangChain create_agent<br/>:8001"]
     NS["🥗 Nutrition Specialist<br/>LangChain create_agent<br/>:8002"]
     DB[("🗄️ SQLite<br/>/data/nimbus-chat.db")]
@@ -32,8 +33,11 @@ graph TB
 
     User -->|HTTP| FE
     FE -->|A2A JSON-RPC / SSE| ORC
-    ORC -->|A2A JSON-RPC| TS
-    ORC -.->|A2A JSON-RPC| NS
+    ORC -->|return_immediately<br/>+ push config| TS
+    ORC -.->|return_immediately<br/>+ push config| NS
+    TS -->|POST push notifications| WH
+    NS -.->|POST push notifications| WH
+    WH -->|CallbackManager<br/>asyncio.Queue| ORC
     ORC --> DB
     TS --> DB
     NS --> DB
@@ -54,6 +58,7 @@ sequenceDiagram
     participant R as Router Agent
     participant S1 as Travel Specialist
     participant S2 as Nutrition Specialist
+    participant WH as Orchestrator Webhook
     participant SY as Synthesizer Agent
 
     U->>F: "Plan a healthy Tokyo trip"
@@ -61,13 +66,22 @@ sequenceDiagram
     O->>R: Route decision (structured output)
     R-->>O: should_route=true, 2 specialists
 
-    par Parallel fan-out
-        O->>S1: A2A sendMessageStream
-        S1-->>O: Streaming artifact (itinerary)
+    par Async fan-out (return_immediately)
+        O->>S1: SendMessage(return_immediately=true, push_url=orchestrator/a2a/callback)
+        S1-->>O: 200 OK (task created)
+        Note over S1: Specialist works in background
+        S1->>WH: POST /a2a/callback (status: WORKING)
+        S1->>WH: POST /a2a/callback (status: COMPLETED, artifacts)
     and
-        O->>S2: A2A sendMessageStream
-        S2-->>O: Streaming artifact (meal plan)
+        O->>S2: SendMessage(return_immediately=true, push_url=orchestrator/a2a/callback)
+        S2-->>O: 200 OK (task created)
+        Note over S2: Specialist works in background
+        S2->>WH: POST /a2a/callback (status: WORKING)
+        S2->>WH: POST /a2a/callback (status: COMPLETED, artifacts)
     end
+
+    WH->>O: CallbackManager routes events to asyncio.Queue
+    Note over O: All responses collected
 
     O->>SY: Synthesize(specialist responses)
     SY-->>O: Streamed unified response
@@ -84,13 +98,16 @@ flowchart TD
     Router --> Decide{"should_route?"}
 
     Decide -->|No| Direct["💬 Responder Agent<br/>streams direct response"]
-    Decide -->|Yes, 1 specialist| Single["🔀 Route to 1 specialist<br/>stream specialist response directly"]
-    Decide -->|Yes, 2+ specialists| FanOut["⚡ Parallel fan-out<br/>asyncio.gather all specialists"]
+    Decide -->|Yes, 1 specialist| Single["🔀 Route to 1 specialist<br/>async push-notification callback"]
+    Decide -->|Yes, 2+ specialists| FanOut["⚡ Parallel async fan-out<br/>return_immediately + push notifications"]
 
-    FanOut --> Collect["📥 Collect all responses"]
-    Collect --> Synth["🧬 Synthesizer Agent<br/>combines responses<br/>streams unified answer"]
+    FanOut --> Collect["📥 Collect responses<br/>from CallbackManager queues"]
+    Collect --> SynthCheck{"needs_synthesis?"}
+    SynthCheck -->|Yes| Synth["🧬 Synthesizer Agent<br/>combines responses<br/>streams unified answer"]
+    SynthCheck -->|No| Sections["📝 Stream each response<br/>with section header<br/>(no extra LLM call)"]
     Single --> Record["💾 record_exchange<br/>into responder thread"]
     Synth --> Record
+    Sections --> Record
     Direct --> Done["✅ Task completed"]
     Record --> Done
 ```
@@ -170,9 +187,10 @@ nimbus-chat/
 │   │   ├── checkpointing.py        # LangGraph AsyncSqliteSaver
 │   │   │
 │   │   ├── orchestrator/
-│   │   │   ├── service.py          # FastAPI app + A2A routes + CORS
-│   │   │   ├── executor.py         # OrchestratorExecutor (fan-out + synthesis)
+│   │   │   ├── service.py          # FastAPI app + A2A routes + webhook + CORS
+│   │   │   ├── executor.py         # OrchestratorExecutor (async fan-out + synthesis)
 │   │   │   ├── routing.py          # Router, Responder, Synthesizer agents
+│   │   │   ├── callback.py         # CallbackManager (push-notification webhook queue)
 │   │   │   ├── registry.py         # Specialist registry (SQLite + agent-card fetch)
 │   │   │   ├── middleware.py       # Specialist prompt injection middleware
 │   │   │   ├── api.py              # REST API (register/refresh/list specialists)
@@ -213,6 +231,8 @@ nimbus-chat/
 | `SPECIALIST_INTERNAL_URL` | `http://travel-specialist:8001` | Docker-internal URL for orchestrator→specialist. |
 | `SPECIALIST_URL_REMAPS` | *(see compose)* | Maps public→internal URLs for multi-specialist routing. |
 | `SPECIALIST_CARD_REFRESH_TTL_SECONDS` | `300` | Agent-card cache TTL. `0` = always refresh, `-1` = never. |
+| `ASYNC_SPECIALIST_MODE` | `true` | Use push notifications + `return_immediately` for specialist calls (no held SSE). |
+| `ORCHESTRATOR_INTERNAL_URL` | `http://localhost:8000` | Internal URL that specialists use to POST push notifications back. |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins. |
 | `VITE_ORCHESTRATOR_BASE_URL` | `http://localhost:8000` | Frontend → orchestrator URL. |
 
@@ -314,27 +334,43 @@ When a specialist responds, the orchestrator calls `responder.record_exchange()`
 
 ---
 
-## ⚡ Parallel Fan-Out
+## ⚡ Parallel Fan-Out with Async Push Notifications
 
-When the router selects multiple specialists:
+When the router selects multiple specialists, the orchestrator uses the **A2A push-notification async pattern** — no long-held SSE connections to specialists:
 
 ```mermaid
 graph LR
     Q["📨 User query<br/>(cross-domain)"] --> R["🧭 Router<br/>selects 2+ specialists"]
-    R --> F["⚡ asyncio.gather"]
-    F --> S1["Specialist A<br/>(concurrent)"]
-    F --> S2["Specialist B<br/>(concurrent)"]
-    S1 --> C["📥 Collect responses"]
-    S2 --> C
-    C --> SY["🧬 Synthesizer Agent<br/>combines + streams"]
+    R --> F["⚡ return_immediately<br/>+ push config"]
+    F --> S1["Specialist A<br/>(background)"]
+    F --> S2["Specialist B<br/>(background)"]
+    S1 -->|"POST /a2a/callback"| WH["📡 Webhook"]
+    S2 -->|"POST /a2a/callback"| WH
+    WH --> CM["CallbackManager<br/>asyncio.Queue"]
+    CM --> SC{"needs_synthesis?"}
+    SC -->|Yes| SY["🧬 Synthesizer<br/>(extra LLM call)"]
+    SC -->|No| SE["📝 Section headers<br/>(no extra LLM call)"]
     SY --> U["👤 Unified response"]
+    SE --> U
 ```
 
-1. **Router** returns `RouteDecision` with `specialists: [SpecialistRoute, ...]`
-2. **`_stream_parallel_specialist_response`** calls all specialists concurrently via `asyncio.gather`
-3. Each specialist's full response is collected
-4. **Synthesizer agent** (a `create_agent` with a synthesis-focused system prompt) takes all responses + the original query and streams a unified answer
-5. The synthesized response is recorded in the responder's thread for future continuity
+1. **Router** returns `RouteDecision` with `specialists: [SpecialistRoute, ...]` and `needs_synthesis: bool`
+2. Orchestrator sends `SendMessage(return_immediately=True)` with a `TaskPushNotificationConfig` pointing to `/a2a/callback` — **specialists return instantly**
+3. Specialists process in the background and **POST push notifications** (status updates, artifact chunks) to the orchestrator webhook
+4. The `CallbackManager` routes events to `asyncio.Queue` per callback token; the executor consumes them
+5. When all specialists complete:
+   - **`needs_synthesis=true`** → Synthesizer agent combines responses into a unified answer (extra LLM call)
+   - **`needs_synthesis=false`** → Each specialist's response streamed directly with section headers (`## Specialist Name`) — **saves tokens, no extra LLM call**
+6. The response is recorded in the responder's thread for conversation continuity
+
+### Toggle: Sync vs Async Mode
+
+The orchestrator↔specialist communication mode is configurable:
+
+```env
+ASYNC_SPECIALIST_MODE=true   # Push notifications + return_immediately (default)
+ASYNC_SPECIALIST_MODE=false  # Traditional streaming SSE (held connections)
+```
 
 ---
 

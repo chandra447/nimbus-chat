@@ -128,22 +128,29 @@ sequenceDiagram
         O-->>F: SSE: artifact_update (chunk 1, append=false)
         O-->>F: SSE: artifact_update (chunk 2, append=true)
         O-->>F: SSE: status_update (COMPLETED)
-    else Single specialist
+    else Single specialist (async push notification)
         O-->>F: SSE: status_update ("Routing to specialist...")
-        O->>O: A2A call to specialist
-        O-->>F: SSE: status_update (specialist working)
-        O-->>F: SSE: artifact_update (specialist response chunks)
+        O->>O: SendMessage(return_immediately=true, push_config)
+        O-->>F: SSE: status_update (specialist working [ASYNC])
+        Note over O: Specialist POSTs push notifications to /a2a/callback
+        O-->>F: SSE: artifact_update (specialist response)
         O-->>F: SSE: status_update (COMPLETED)
-    else Parallel fan-out
+    else Parallel fan-out (async push notifications)
         O-->>F: SSE: status_update ("Routing to 2 specialists in parallel...")
-        par Specialist A
-            O->>O: A2A call (concurrent)
-        and Specialist B
-            O->>O: A2A call (concurrent)
+        par Specialist A (return_immediately)
+            O->>O: SendMessage + push_config
+        and Specialist B (return_immediately)
+            O->>O: SendMessage + push_config
         end
-        O-->>F: SSE: status_update (each specialist working)
-        O-->>F: SSE: status_update ("Synthesizing...")
-        O-->>F: SSE: artifact_update (synthesized chunks)
+        O-->>F: SSE: status_update (each specialist working [ASYNC])
+        Note over O: Specialists POST push notifications to /a2a/callback
+        alt needs_synthesis=true
+            O-->>F: SSE: status_update ("Synthesizing...")
+            O-->>F: SSE: artifact_update (synthesized chunks)
+        else needs_synthesis=false
+            O-->>F: SSE: artifact_update (section header + response A)
+            O-->>F: SSE: artifact_update (section header + response B)
+        end
         O-->>F: SSE: status_update (COMPLETED)
     end
 ```
@@ -227,6 +234,74 @@ async for token in agent.astream_events(...):
 ```
 
 This allows the frontend to render text as it streams in, rather than waiting for the complete response.
+
+---
+
+## Push Notifications (Async Callback Pattern)
+
+The A2A protocol supports **push notifications** for disconnected/async scenarios. Nimbus Chat uses this pattern for all orchestrator→specialist communication.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant CM as CallbackManager
+    participant S as Specialist
+    participant WH as Webhook /a2a/callback
+
+    O->>CM: create_queue(callback_token)
+    O->>S: SendMessage(return_immediately=true, push_config={url, token})
+    S-->>O: 200 OK (initial Task)
+    Note over S: Specialist works in background
+    Note over O: Orchestrator connection freed
+
+    loop Background processing
+        S->>WH: POST /a2a/callback (StreamResponse JSON)
+        Note right of WH: Header: X-A2A-Notification-Token
+        WH->>CM: push_event(token, parsed StreamResponse)
+        CM->>O: queue.get() → event
+        O->>O: relay to client SSE
+    end
+
+    S->>WH: POST /a2a/callback (terminal status)
+    WH->>CM: push_event(token, terminal event)
+    CM->>O: queue.get() → COMPLETED
+    O->>CM: remove_queue(token)
+```
+
+### Key Components
+
+| Component | File | Role |
+|---|---|---|
+| `CallbackManager` | `app/orchestrator/callback.py` | In-memory `token → asyncio.Queue` registry |
+| Webhook endpoint | `POST /a2a/callback` on orchestrator | Receives push notifications, routes to queue |
+| `BasePushNotificationSender` | A2A SDK (on specialist) | POSTs `StreamResponse` events to webhook URL |
+| `TaskPushNotificationConfig` | A2A proto | Contains `url` + `token` for callbacks |
+
+### Request Configuration
+
+The orchestrator sends `SendMessage` with:
+
+```python
+SendMessageRequest(
+    message=Message(...),
+    configuration=SendMessageConfiguration(
+        return_immediately=True,           # Don't wait for completion
+        task_push_notification_config=TaskPushNotificationConfig(
+            url=f'{orchestrator_internal_url}/a2a/callback',
+            token=callback_token,           # Unique per specialist call
+        ),
+    ),
+)
+```
+
+### Toggle: Sync vs Async
+
+```env
+ASYNC_SPECIALIST_MODE=true   # Push notifications (default) — no held connections
+ASYNC_SPECIALIST_MODE=false  # Streaming SSE — simpler, holds connections open
+```
 
 ---
 

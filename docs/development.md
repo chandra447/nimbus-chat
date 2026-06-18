@@ -199,6 +199,7 @@ Any model supported by OpenRouter works — see [openrouter.ai/models](https://o
 |---|---|
 | `backend/app/llm.py` | LLM model configuration |
 | `backend/app/settings.py` | All environment-driven settings |
+| `backend/app/orchestrator/callback.py` | CallbackManager (push-notification webhook queue) |
 | `backend/app/orchestrator/routing.py` | Router, Responder, Synthesizer agents |
 | `backend/app/orchestrator/executor.py` | Fan-out logic and streaming |
 | `backend/app/orchestrator/registry.py` | Specialist registration + URL normalization |
