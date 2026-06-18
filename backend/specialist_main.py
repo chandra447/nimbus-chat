@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.settings import get_settings
-from app.specialist.configs import get_specialist_config
+from app.specialist import get_specialist_config
 from app.specialist.service import create_specialist_app
 
 settings = get_settings()

@@ -1,9 +1,9 @@
-"""App-level wiring that turns a SpecialistConfig into a running server.
+"""App-level wiring: turn a Nimbus :class:`SpecialistConfig` into a FastAPI app.
 
-This is a thin adapter: it builds the app's chat model and a
-:class:`SpecialistServerConfig` from the app settings, then delegates to
-``nimbus_a2a.create_specialist_app``. All A2A / push-notification / streaming
-plumbing lives in the SDK.
+Builds the app's chat model, a LangGraph SQLite checkpointer factory, a
+:class:`LangChainSpecialistExecutor`, and an A2A ``AgentCard`` — then delegates
+to the SDK's :func:`nimbus_a2a.create_specialist_app` for all A2A / push-
+notification / streaming plumbing.
 """
 
 from __future__ import annotations
@@ -13,8 +13,10 @@ from fastapi import FastAPI
 from app.checkpointing import create_sqlite_checkpointer
 from app.llm import build_chat_model
 from app.settings import Settings
-from nimbus_a2a import SpecialistConfig, SpecialistServerConfig
-from nimbus_a2a.server import create_specialist_app as _create_specialist_app_sdk
+from app.specialist.agent_card import build_specialist_agent_card
+from app.specialist.config import SpecialistConfig
+from app.specialist.executor import LangChainSpecialistExecutor
+from nimbus_a2a import SpecialistServerConfig, create_specialist_app as create_specialist_app_sdk
 
 
 def create_specialist_app(settings: Settings, config: SpecialistConfig) -> FastAPI:
@@ -23,24 +25,33 @@ def create_specialist_app(settings: Settings, config: SpecialistConfig) -> FastA
     async def checkpointer_factory():
         return await create_sqlite_checkpointer(settings)
 
+    executor = LangChainSpecialistExecutor(
+        config,
+        model=model,
+        checkpointer_factory=checkpointer_factory,
+        tavily_api_key=settings.tavily_api_key,
+        tavily_enabled=settings.tavily_enabled,
+    )
+
+    agent_card = build_specialist_agent_card(
+        config,
+        public_url=settings.specialist_public_url,
+        internal_url=settings.specialist_internal_url,
+    )
+
     server = SpecialistServerConfig(
         db_url=settings.sqlite_async_url,
         public_url=settings.specialist_public_url,
         internal_url=settings.specialist_internal_url,
         cors_origins=settings.cors_origins,
-        tavily_api_key=settings.tavily_api_key,
-        tavily_enabled=settings.tavily_enabled,
+        tasks_table=config.tasks_table,
+        push_notification_table=config.push_notification_table,
     )
 
-    return _create_specialist_app_sdk(
-        config,
-        server,
-        model=model,
-        checkpointer_factory=checkpointer_factory,
-    )
+    return create_specialist_app_sdk(executor, agent_card, server=server)
 
 
 # Backwards-compatible alias.
 def create_travel_specialist_app(settings: Settings) -> FastAPI:
-    from app.specialist.configs import travel_config
+    from app.specialist.travel import travel_config
     return create_specialist_app(settings, travel_config)

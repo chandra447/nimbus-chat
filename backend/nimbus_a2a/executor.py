@@ -1,37 +1,34 @@
-"""Specialist executor — turns a config into an A2A agent that supports the
-``return_immediately`` + push-notification pattern.
+"""Specialist executor — the core abstraction teams subclass.
 
-Two output modes (declared on the config, advertised on the agent card):
+A specialist team builds their agent with **any** framework (LangChain,
+LangGraph, Pydantic AI, DSPy, raw LLM calls, …) and subclasses
+:class:`SpecialistExecutor`, overriding **one** of:
 
-- **streaming=True** (default): the specialist buffers LLM tokens and pushes
-  incremental artifact chunks to the orchestrator webhook as it generates.
-  Gives a live activity-trail preview. Roughly O(response_len / buffer) push
-  notifications.
+- :meth:`stream` — an async generator yielding text chunks (use when
+  ``streaming=True``; gives a live activity-trail preview).
+- :meth:`invoke` — returns the full response string (use when
+  ``streaming=False``; pushes a single final artifact).
 
-- **streaming=False**: the specialist accumulates the full response and pushes
-  **one** final artifact on completion (then COMPLETED). Minimal push
-  notifications, no live preview. Ideal for cheap/fast specialists or when the
-  orchestrator only needs the final answer.
+If only one is overridden, the other derives from it automatically
+(``invoke`` collects ``stream``; ``stream`` yields ``invoke`` as one chunk).
 
-In both modes the orchestrator's webhook correlates the push (via the
-``X-A2A-Notification-Token`` header → callback token → interrupt id) and
-resumes the paused LangGraph interrupt with the specialist's response.
+The SDK handles everything else: the A2A protocol, task lifecycle, and the
+``return_immediately`` + push-notification artifact chunking. With
+``streaming=True`` it buffers tokens and pushes incremental artifact chunks;
+with ``streaming=False`` it accumulates the response and pushes one final
+artifact. Teams never touch A2A internals.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import AsyncIterator
 
 from a2a.helpers import new_task_from_user_message
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.server.tasks.task_updater import TaskUpdater
-from a2a.types.a2a_pb2 import Message, Part, Role, TaskState
-from langchain.agents import create_agent
-
-from nimbus_a2a.config import SpecialistConfig
-from nimbus_a2a.tools import build_tavily_research_tool
+from a2a.types.a2a_pb2 import Message, Part, Role
 
 
 def _agent_message(*, task_id: str, context_id: str, text: str) -> Message:
@@ -44,99 +41,116 @@ def _agent_message(*, task_id: str, context_id: str, text: str) -> Message:
 
 
 class SpecialistExecutor(AgentExecutor):
-    """Runs a LangChain agent and streams/returns its output via A2A push.
+    """Base class for A2A specialists. Override ``invoke`` or ``stream``.
 
-    The executor is constructed with the chat model + checkpointer (injected by
-    the app) and the specialist config. Everything else — task creation,
-    ``return_immediately`` handling, push-notification wiring, buffered artifact
-    writing — is handled here and by the A2A SDK's ``DefaultRequestHandler``.
+    Args:
+        streaming: Declares the specialist's output mode.
+            ``True`` → the SDK pushes buffered incremental artifact chunks via
+            push notifications (live preview). ``False`` → the SDK accumulates
+            the full response and pushes a single final artifact (minimal
+            notifications). Advertised on the agent card's ``streaming``
+            capability by :func:`nimbus_a2a.create_specialist_app`.
+        artifact_name: Name label on the artifact pushed to the orchestrator.
+        label: Human-friendly name used in the start/complete status messages.
     """
 
     def __init__(
         self,
-        config: SpecialistConfig,
         *,
-        model: Any,
-        checkpointer: Any,
-        tavily_api_key: str = '',
-        tavily_enabled: bool = False,
+        streaming: bool = True,
+        artifact_name: str = 'specialist-response',
+        label: str = 'Specialist',
     ) -> None:
-        self.config = config
-        self.model = model
-        self.checkpointer = checkpointer
-        self.tavily_api_key = tavily_api_key
-        self.tavily_enabled = tavily_enabled
-        self._agent: Any = None
+        self.streaming = streaming
+        self.artifact_name = artifact_name
+        self.label = label
 
     # ------------------------------------------------------------------
-    # Agent construction
+    # Lifecycle hooks (override if you need async resource setup/teardown)
     # ------------------------------------------------------------------
 
-    def _build_tools(self) -> list[Any]:
-        tools: list[Any] = list(self.config.extra_tools)
-        if self.tavily_enabled and self.tavily_api_key:
-            tools.append(
-                build_tavily_research_tool(
-                    self.tavily_api_key,
-                    tool_name=self.config.tavily_tool_name,
-                    tool_description=self.config.tavily_tool_description,
-                )
+    async def startup(self) -> None:
+        """Called once inside the app lifespan, before any request.
+
+        Override to build async resources (DB connections, checkpointers,
+        model clients…). The default is a no-op.
+        """
+
+    async def shutdown(self) -> None:
+        """Called once on app shutdown. Override to close resources."""
+
+    # ------------------------------------------------------------------
+    # Team-implemented agent logic (override ONE of these)
+    # ------------------------------------------------------------------
+
+    async def invoke(self, message: str, *, context_id: str) -> str:
+        """Return the full response string.
+
+        Override this for non-streaming agents (``streaming=False``). The
+        default implementation collects :meth:`stream` into a string, so if you
+        override :meth:`stream` you get this for free.
+        """
+        chunks: list[str] = []
+        async for chunk in self.stream(message, context_id=context_id):
+            chunks.append(chunk)
+        return ''.join(chunks)
+
+    async def stream(self, message: str, *, context_id: str) -> AsyncIterator[str]:
+        """Yield text chunks.
+
+        Override this for streaming agents (``streaming=True``). The default
+        implementation yields :meth:`invoke` as a single chunk, so if you
+        override :meth:`invoke` you get this for free.
+        """
+        yield await self.invoke(message, context_id=context_id)
+
+    # ------------------------------------------------------------------
+    # A2A AgentExecutor — handled by the SDK (do not override)
+    # ------------------------------------------------------------------
+
+    def _ensure_implemented(self) -> None:
+        # Detect the "neither overridden" case to give a clear error instead
+        # of infinite mutual recursion between invoke() and stream().
+        invoked_overridden = type(self).invoke is not SpecialistExecutor.invoke
+        streamed_overridden = type(self).stream is not SpecialistExecutor.stream
+        if not (invoked_overridden or streamed_overridden):
+            raise NotImplementedError(
+                f'{type(self).__name__} must override invoke() or stream()'
             )
-        return tools
-
-    def _get_agent(self) -> Any:
-        if self._agent is None:
-            if self.config.agent_factory is not None:
-                self._agent = self.config.agent_factory(
-                    self.config, self._build_tools(), self.checkpointer
-                )
-            else:
-                self._agent = create_agent(
-                    model=self.model,
-                    tools=self._build_tools(),
-                    system_prompt=self.config.system_prompt,
-                    checkpointer=self.checkpointer,
-                    name=f'nimbus-{self.config.table_name_prefix}',
-                )
-        return self._agent
-
-    # ------------------------------------------------------------------
-    # A2A execution
-    # ------------------------------------------------------------------
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        self._ensure_implemented()
+
         task_id = context.task_id
         context_id = context.context_id
-        user_input = context.get_user_input().strip()
-
         if not task_id or not context_id:
             raise ValueError('task_id and context_id are required for specialist execution')
 
+        user_input = context.get_user_input().strip()
         if context.current_task is None:
             if context.message is None:
                 raise ValueError('User message is required to create a task')
             await event_queue.enqueue_event(new_task_from_user_message(context.message))
 
-        label = self.config.label
         updater = TaskUpdater(event_queue, task_id, context_id)
         await updater.start_work(
             _agent_message(
                 task_id=task_id,
                 context_id=context_id,
-                text=f'{label} received the request and is preparing a response.',
+                text=f'{self.label} received the request and is preparing a response.',
             )
         )
 
-        if self.config.streaming:
-            await self._run_streaming(context_id, user_input, task_id, updater, label)
+        if self.streaming:
+            await self._run_streaming(context_id, user_input, task_id, updater)
         else:
-            await self._run_non_streaming(context_id, user_input, task_id, updater, label)
+            await self._run_non_streaming(context_id, user_input, task_id, updater)
 
         await updater.complete(
             _agent_message(
                 task_id=task_id,
                 context_id=context_id,
-                text=f'{label} completed the response.',
+                text=f'{self.label} completed the response.',
             )
         )
 
@@ -146,10 +160,9 @@ class SpecialistExecutor(AgentExecutor):
         user_input: str,
         task_id: str,
         updater: TaskUpdater,
-        label: str,
     ) -> None:
-        """Buffer tokens and flush incremental artifact chunks via push notifications."""
-        artifact_id = f'{task_id}-{self.config.table_name_prefix}-response'
+        """Buffer tokens from :meth:`stream` and push incremental artifacts."""
+        artifact_id = f'{task_id}-response'
         FLUSH_CHARS = 2000
         FLUSH_INTERVAL = 2.0
         buffer: list[str] = []
@@ -165,18 +178,19 @@ class SpecialistExecutor(AgentExecutor):
                 return
             await updater.add_artifact(
                 artifact_id=artifact_id,
-                name=self.config.artifact_name,
+                name=self.artifact_name,
                 parts=[Part(text=''.join(buffer))],
                 append=not first_chunk,
                 last_chunk=False,
-                metadata={'source': self.config.table_name_prefix},
             )
             first_chunk = False
             buffer = []
             buffer_len = 0
             last_flush = time.monotonic()
 
-        async for text in self._stream_tokens(context_id, user_input):
+        async for text in self.stream(user_input, context_id=context_id):
+            if not text:
+                continue
             buffer.append(text)
             buffer_len += len(text)
             await flush()
@@ -189,54 +203,17 @@ class SpecialistExecutor(AgentExecutor):
         user_input: str,
         task_id: str,
         updater: TaskUpdater,
-        label: str,
     ) -> None:
-        """Accumulate the full response, then push ONE final artifact."""
-        artifact_id = f'{task_id}-{self.config.table_name_prefix}-response'
-        parts: list[str] = []
-        async for text in self._stream_tokens(context_id, user_input):
-            parts.append(text)
-        full = ''.join(parts)
-
+        """Accumulate :meth:`invoke` and push ONE final artifact."""
+        artifact_id = f'{task_id}-response'
+        full = await self.invoke(user_input, context_id=context_id)
         await updater.add_artifact(
             artifact_id=artifact_id,
-            name=self.config.artifact_name,
+            name=self.artifact_name,
             parts=[Part(text=full)],
             append=False,
             last_chunk=True,
-            metadata={'source': self.config.table_name_prefix, 'mode': 'non-streaming'},
         )
-
-    async def _stream_tokens(self, context_id: str, user_input: str):
-        """Yield text tokens from the underlying LangChain agent."""
-        async for event in self._get_agent().astream_events(
-            {
-                'messages': [
-                    {
-                        'role': 'user',
-                        'content': user_input,
-                    }
-                ]
-            },
-            config={
-                'configurable': {'thread_id': f'{context_id}:{self.config.table_name_prefix}'},
-                'recursion_limit': 15,
-            },
-            version='v2',
-        ):
-            if event.get('event') != 'on_chat_model_stream':
-                continue
-            chunk = event.get('data', {}).get('chunk')
-            text = getattr(chunk, 'text', None)
-            if text is None:
-                continue
-            if isinstance(text, str) and not text:
-                continue
-            if callable(text):
-                text = text()
-                if not text:
-                    continue
-            yield text
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         task_id = context.task_id
@@ -248,6 +225,6 @@ class SpecialistExecutor(AgentExecutor):
             _agent_message(
                 task_id=task_id,
                 context_id=context_id,
-                text=f'{self.config.name} task cancelled.',
+                text=f'{self.label} task cancelled.',
             )
         )

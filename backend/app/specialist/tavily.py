@@ -1,4 +1,4 @@
-"""Optional tool helpers for specialists."""
+"""LangChain Tavily research tool — app-specific (the SDK is framework-agnostic)."""
 
 from __future__ import annotations
 

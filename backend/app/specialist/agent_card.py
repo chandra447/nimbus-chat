@@ -1,4 +1,9 @@
-"""Build an A2A ``AgentCard`` from a :class:`SpecialistConfig`."""
+"""Build an A2A ``AgentCard`` from an app-level :class:`SpecialistConfig`.
+
+The SDK does not build agent cards — specialist teams own their cards. This
+helper is the Nimbus Chat app's convenience builder for its LangChain
+specialists.
+"""
 
 from __future__ import annotations
 
@@ -10,21 +15,21 @@ from a2a.types.a2a_pb2 import (
     AgentSkill,
 )
 
-from nimbus_a2a.config import SpecialistConfig
+from app.specialist.config import SpecialistConfig
 
 
-def build_agent_card(
+def build_specialist_agent_card(
     config: SpecialistConfig,
     *,
     public_url: str,
     internal_url: str,
 ) -> AgentCard:
-    """Build an A2A AgentCard advertising the specialist's capabilities.
+    """Build an A2A AgentCard for a Nimbus specialist.
 
-    The ``streaming`` capability reflects ``config.streaming`` — ``True`` means
-    the specialist pushes incremental artifact chunks; ``False`` means it
-    returns a single final response. ``push_notifications`` is always ``True``
-    (the specialist works in the background after ``return_immediately=True``).
+    Note: the ``streaming`` capability is set from ``config.streaming`` here,
+    but the SDK's :func:`create_specialist_app` will reconcile it against the
+    executor's ``streaming`` flag (the executor is the source of truth).
+    ``push_notifications`` is always ``True``.
     """
     return AgentCard(
         name=config.name,
