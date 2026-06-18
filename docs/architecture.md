@@ -6,8 +6,8 @@ Nimbus Chat is a multi-agent system built on the A2A (Agent-to-Agent) protocol. 
 
 | Service | Port | Role |
 |---|---|---|
-| **Frontend** | 3000 | React SPA — chat UI, specialist management, conversation history |
-| **Orchestrator** | 8000 | A2A server + router + responder + synthesizer + specialist registry |
+| **Frontend** | 3000 | React SPA (plain SSE client, no A2A SDK) — chat UI, specialist management, conversation history |
+| **Orchestrator** | 8000 | LangGraph StateGraph + FastAPI — router/responder/synthesizer + specialist registry + SSE endpoint + push-notification webhook |
 | **Travel Specialist** | 8001 | A2A server + LangChain agent with Tavily research tool |
 | **Nutrition Specialist** | 8002 | A2A server + LangChain agent with Tavily research tool |
 
@@ -22,13 +22,15 @@ graph TB
     subgraph "Frontend (:3000)"
         UI[Chat UI]
         Modal[Specialist Modal]
-        A2AClient["@a2a-js/sdk Client"]
+        SSEClient["Plain SSE Client<br/>fetch POST /api/chat"]
     end
 
     subgraph "Orchestrator (:8000)"
         API[REST API]
-        A2AServer[A2A JSON-RPC Server]
-        Executor[OrchestratorExecutor]
+        SSE["POST /api/chat (SSE)"]
+        Webhook["POST /a2a/callback"]
+        Graph["LangGraph StateGraph"]
+        Driver["GraphSession driver"]
         Router["Router Agent<br/>create_agent + structured output"]
         Responder["Responder Agent<br/>create_agent + streaming"]
         Synthesizer["Synthesizer Agent<br/>create_agent + streaming"]
@@ -47,27 +49,31 @@ graph TB
     end
 
     subgraph "Persistence"
-        SQLite[("SQLite<br/>/data/nimbus-chat.db")]
+        SQLite[("SQLite<br/>checkpoints + memory")]
     end
 
-    UI --> A2AClient
-    A2AClient -->|SSE stream| A2AServer
+    UI --> SSEClient
+    SSEClient -->|SSE stream| SSE
     Modal -->|REST| API
 
-    A2AServer --> Executor
-    Executor --> Router
-    Executor --> Responder
-    Executor --> Synthesizer
+    SSE --> Driver
+    Driver --> Graph
+    Graph --> Router
+    Graph --> Responder
+    Graph --> Synthesizer
     Router --> MW
     MW --> Registry
 
-    Executor -->|A2A client| TSExec
-    Executor -->|A2A client| NSExec
+    Driver -->|A2A return_immediately| TSExec
+    Driver -->|A2A return_immediately| NSExec
+    TSExec -->|push notifications| Webhook
+    NSExec -->|push notifications| Webhook
+    Webhook -->|Command(resume)| Driver
     TSExec --> TSAgent
     NSExec --> NSAgent
 
     Registry --> SQLite
-    A2AServer --> SQLite
+    Graph --> SQLite
     TSExec --> SQLite
     NSExec --> SQLite
 ```
@@ -76,35 +82,77 @@ graph TB
 
 ## Orchestrator Internals
 
-### The OrchestratorExecutor
+The orchestrator is a **LangGraph `StateGraph`** (see `graph.py`) checkpointed to SQLite, driven by a per-request **`GraphSession`** (see `session.py`). It is **not** an A2A server — it exposes a plain FastAPI SSE endpoint (`POST /api/chat`) and a push-notification webhook (`POST /a2a/callback`).
 
-The `OrchestratorExecutor` implements the A2A `AgentExecutor` interface. Its `execute()` method is the entry point for every user message:
+### The StateGraph
 
 ```mermaid
 flowchart TD
-    Start["execute(context, event_queue)"] --> CreateTask["Create A2A Task<br/>if not exists"]
-    CreateTask --> StartWork["Emit TASK_STATE_WORKING<br/>'Analyzing routing options'"]
-    StartWork --> Route["await router.decide(user_input)"]
-    Route --> Decision{"RouteDecision"}
-
-    Decision -->|should_route=false| Direct["💬 Responder Agent<br/>streams direct response"]
-    Decision -->|1 specialist| Single["🔀 Route to 1 specialist<br/>async push-notification callback"]
-    Decision -->|2+ specialists| FanOut["⚡ Parallel async fan-out<br/>return_immediately + push notifications"]
-
-    FanOut --> Collect["📥 Collect responses<br/>from CallbackManager queues"]
-    Collect --> SynthCheck{"needs_synthesis?"}
-    SynthCheck -->|Yes| Synth["🧬 Synthesizer Agent<br/>combines responses<br/>streams unified answer"]
-    SynthCheck -->|No| Sections["📝 Stream each response<br/>with section header<br/>(no extra LLM call)"]
-    Single --> Record["💾 record_exchange<br/>into responder thread"]
-    Synth --> Record
-    Sections --> Record
-    Direct --> Done["✅ Task completed"]
-    Record --> Done
+    Start["POST /api/chat → GraphSession.start()"] --> Route["🧭 route node<br/>router.decide() → RouteDecision"]
+    Route --> Decide{"should_route?"}
+    Decide -->|No| Respond["💬 respond node<br/>responder streams tokens"]
+    Decide -->|Yes| Send["⚡ Send fan-out<br/>one specialist_wait task per specialist"]
+    Send --> SW["⏸️ specialist_wait<br/>calls interrupt() (pure)"]
+    SW --> Pause["Graph PAUSES<br/>state checkpointed to SQLite<br/>driver dispatches A2A return_immediately"]
+    Pause --> Resume["⏳ webhook resumes each interrupt<br/>Command(resume={id: response})<br/>one at a time; graph re-pauses between"]
+    Resume --> After{"needs_synthesis?"}
+    After -->|Yes| Synth["🧬 synthesize node<br/>synthesizer streams unified answer"]
+    After -->|No| Assemble["📝 assemble node<br/>section headers, no LLM call"]
+    Respond --> Done["✅ done event (SSE)"]
+    Synth --> Done
+    Assemble --> Done
 ```
+
+**Nodes:**
+
+| Node | Role |
+|---|---|
+| `route` | Calls the router agent (structured output). Fans out via `Send` or routes to `respond`. |
+| `respond` | Responder agent streams a direct answer (no specialist). |
+| `specialist_wait` | **Pure `interrupt()`** — no side effects before the call (LangGraph re-runs nodes on resume). The interrupt payload carries specialist name/url/query for the driver. |
+| `synthesize` | Synthesizer agent streams a unified answer from multiple specialist responses. |
+| `assemble` | Concatenates specialist responses with `## Specialist Name` headers — no LLM call. |
+
+> **Why the `specialist_wait` node is pure:** LangGraph re-runs a node from the top when its interrupt is resumed. If the A2A `send_message` lived inside the node, it would fire twice. So the node only calls `interrupt()`; the driver sends the A2A request *after* the graph pauses.
+
+### The GraphSession driver loop
+
+Each `/api/chat` request creates a `GraphSession` that owns an `asyncio.Queue` of SSE events and a `resume_queue` of `Command(resume=...)` objects. The driver:
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend (SSE)
+    participant D as Driver (GraphSession)
+    participant G as StateGraph
+    participant S as Specialist
+    participant WH as Webhook
+
+    FE->>D: POST /api/chat
+    D->>G: astream(input, stream_mode=[updates,custom])
+    G-->>D: route node runs → fan-out → interrupt()
+    Note over G: PAUSED (SQLite checkpoint)
+    D->>S: SendMessage(return_immediately=true, push_config)
+    S-->>D: 200 OK
+    D-->>FE: status events (routing, working)
+
+    S->>WH: POST /a2a/callback (chunks)
+    WH-->>FE: specialist_chunk events (activity trail)
+    S->>WH: POST /a2a/callback (COMPLETED)
+    WH->>D: resume_queue.put(Command(resume={id: resp}))
+    D->>G: astream(Command(resume=...))
+    Note over G: branch resumes; re-pauses if other interrupts pending
+    G-->>D: (repeats per specialist) → synthesize/assemble → END
+    D-->>FE: token events (streamed answer) + done
+```
+
+1. Run `graph.astream(input, config, stream_mode=['updates','custom'])`; relay `custom` events (status/token from `get_stream_writer`) to the SSE queue.
+2. When the stream ends, inspect `graph.aget_state()`. If there are pending interrupts → for each *new* interrupt, register a callback token and fire `SendMessage(return_immediately=True)` with a push config. Then `await resume_queue.get()`.
+3. The webhook pushes `Command(resume={interrupt_id: response})` as each specialist completes. Each resume drives another `astream` iteration. With multiple specialists, the graph resumes one branch and **re-pauses** (partial resume of multiple interrupts) until all are done.
+4. When no interrupts remain, the graph reaches `END`; the driver emits `done` and records the exchange into the responder's thread for continuity.
 
 ### Three LangChain Agents
 
-The orchestrator runs three separate `create_agent` instances, each with its own LangGraph thread namespace:
+The orchestrator runs three separate `create_agent` instances (called from inside graph nodes), each with its own LangGraph thread namespace for conversation memory:
 
 | Agent | Thread ID | Purpose |
 |---|---|---|
@@ -112,7 +160,7 @@ The orchestrator runs three separate `create_agent` instances, each with its own
 | **Responder** | `{contextId}:respond` | Direct responses when no specialist is needed |
 | **Synthesizer** | `{contextId}:synthesize` | Combines multiple specialist responses into one (only when `needs_synthesis=true`) |
 
-All three share the same SQLite checkpointer, so conversation history persists across restarts.
+The **parent orchestrator graph** uses a fresh thread per turn (`{contextId}:orch:{turn_id}`) so each turn's state is isolated; conversation memory lives in the nested agents.
 
 ### Router Agent
 
@@ -126,46 +174,7 @@ class RouteDecision(BaseModel):
     rationale: str
 ```
 
-The `RegisteredSpecialistPromptMiddleware` injects a formatted list of all registered specialists (with their skills, tags, examples) into the router's system prompt before each call. The router then decides which specialists are relevant and whether their advice overlaps enough to require synthesis.
-
-### Async Push-Notification Pattern
-
-The orchestrator communicates with specialists using the A2A push-notification async pattern (configurable via `ASYNC_SPECIALIST_MODE`):
-
-```mermaid
-sequenceDiagram
-    participant O as Orchestrator
-    participant CM as CallbackManager
-    participant S as Specialist
-    participant WH as Webhook /a2a/callback
-
-    O->>CM: create_queue(callback_token)
-    O->>S: SendMessage(return_immediately=true, push_config=url+token)
-    S-->>O: 200 OK (initial Task)
-    Note over S: Specialist works in background
-    Note over O: Orchestrator freed up
-
-    S->>WH: POST /a2a/callback (StreamResponse: status_update WORKING)
-    WH->>CM: push_event(token, event)
-    CM->>O: queue.get() → event
-    O->>O: relay status to client SSE
-
-    S->>WH: POST /a2a/callback (StreamResponse: status_update COMPLETED)
-    WH->>CM: push_event(token, event)
-    CM->>O: queue.get() → terminal event
-    O->>O: break loop, cleanup queue
-```
-
-**How it works:**
-1. The executor generates a unique `callback_token` and creates an `asyncio.Queue` in the `CallbackManager`
-2. It sends a non-streaming `SendMessage` with `return_immediately=True` and a `TaskPushNotificationConfig` containing the orchestrator webhook URL + token
-3. The specialist returns the initial `Task` immediately and continues processing in the background
-4. As the specialist works, the A2A SDK's `BasePushNotificationSender` POSTs `StreamResponse` events to `/a2a/callback`
-5. The webhook parses the event, extracts the token from the `X-A2A-Notification-Token` header, and pushes it into the corresponding `asyncio.Queue`
-6. The executor consumes events from the queue — relaying status updates and collecting artifact chunks
-7. When a terminal state arrives (`COMPLETED`/`FAILED`), the executor finishes and cleans up the queue
-
-**Fallback:** When `ASYNC_SPECIALIST_MODE=false`, the executor uses traditional streaming SSE (`send_message_stream`) — simpler but holds the A2A connection open for the entire specialist execution.
+The `RegisteredSpecialistPromptMiddleware` injects a formatted list of all registered specialists (with their skills, tags, examples) into the router's system prompt before each call.
 
 ### Specialist Prompt Middleware
 

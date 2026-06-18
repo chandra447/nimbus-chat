@@ -199,14 +199,15 @@ Any model supported by OpenRouter works — see [openrouter.ai/models](https://o
 |---|---|
 | `backend/app/llm.py` | LLM model configuration |
 | `backend/app/settings.py` | All environment-driven settings |
-| `backend/app/orchestrator/callback.py` | CallbackManager (push-notification webhook queue) |
+| `backend/app/orchestrator/graph.py` | The LangGraph StateGraph (route/respond/specialist_wait/synthesize/assemble) |
+| `backend/app/orchestrator/session.py` | GraphSession driver loop + SessionRegistry (interrupt↔push bridge) |
+| `backend/app/orchestrator/service.py` | FastAPI app: POST /api/chat (SSE) + /a2a/callback webhook + REST + CORS |
 | `backend/app/orchestrator/routing.py` | Router, Responder, Synthesizer agents |
-| `backend/app/orchestrator/executor.py` | Fan-out logic and streaming |
 | `backend/app/orchestrator/registry.py` | Specialist registration + URL normalization |
 | `backend/app/specialist/builder.py` | Generic specialist framework |
 | `backend/app/specialist/configs.py` | Travel + Nutrition specialist configs |
 | `frontend/src/routes/home-page.tsx` | Main chat UI |
-| `frontend/src/lib/a2a.ts` | A2A client factory |
+| `frontend/src/lib/chat-stream.ts` | Plain SSE client (POST /api/chat + event parser) |
 | `docker-compose.yml` | Service orchestration |
 
 ---

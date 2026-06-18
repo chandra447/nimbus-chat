@@ -1,6 +1,6 @@
 # A2A Protocol Guide
 
-The **Agent-to-Agent (A2A) protocol** is an open standard for agent interoperability. Nimbus Chat uses the A2A Python SDK (`a2a-sdk`) on the backend and the A2A JavaScript SDK (`@a2a-js/sdk`) on the frontend.
+The **Agent-to-Agent (A2A) protocol** is an open standard for agent interoperability. Nimbus Chat uses the A2A Python SDK (`a2a-sdk`) for the **specialists** (which are A2A servers) and for the **orchestrator** (which calls them as an A2A client with `return_immediately=True` + push notifications). The frontend is a normal React app that consumes a plain SSE stream — it does **not** use the A2A SDK.
 
 ---
 
@@ -112,107 +112,82 @@ SPECIALIST_URL_REMAPS=http://localhost:8001=http://travel-specialist:8001,http:/
 
 ### Streaming Message Flow
 
+The **frontend is a normal React app** (no A2A SDK). It POSTs to `/api/chat` and consumes a plain SSE stream. A2A is only used **between the orchestrator and specialists** (the orchestrator is an A2A *client*, specialists are A2A *servers*).
+
 ```mermaid
 sequenceDiagram
-    participant F as Frontend (@a2a-js/sdk)
-    participant O as Orchestrator (a2a-sdk)
+    participant F as Frontend (plain fetch)
+    participant O as Orchestrator (StateGraph)
+    participant S1 as Specialist A (A2A server)
+    participant S2 as Specialist B (A2A server)
+    participant WH as Webhook
 
-    F->>O: POST /a2a/jsonrpc
-    Note right of F: method: "message/stream"<br/>body: { message, contextId }
+    F->>O: POST /api/chat {message, context_id} (SSE)
+    O-->>F: data: status (routing)
+    O-->>F: data: status (route_decision: 2 specialists)
+    Note over O: graph fans out, specialist_wait × 2 call interrupt()<br/>graph PAUSES (SQLite checkpoint)
 
-    O-->>F: SSE: task (SUBMITTED)
-    Note over O: Router decides routing
-
-    alt Direct response
-        O-->>F: SSE: status_update (WORKING)
-        O-->>F: SSE: artifact_update (chunk 1, append=false)
-        O-->>F: SSE: artifact_update (chunk 2, append=true)
-        O-->>F: SSE: status_update (COMPLETED)
-    else Single specialist (async push notification)
-        O-->>F: SSE: status_update ("Routing to specialist...")
-        O->>O: SendMessage(return_immediately=true, push_config)
-        O-->>F: SSE: status_update (specialist working [ASYNC])
-        Note over O: Specialist POSTs push notifications to /a2a/callback
-        O-->>F: SSE: artifact_update (specialist response)
-        O-->>F: SSE: status_update (COMPLETED)
-    else Parallel fan-out (async push notifications)
-        O-->>F: SSE: status_update ("Routing to 2 specialists in parallel...")
-        par Specialist A (return_immediately)
-            O->>O: SendMessage + push_config
-        and Specialist B (return_immediately)
-            O->>O: SendMessage + push_config
-        end
-        O-->>F: SSE: status_update (each specialist working [ASYNC])
-        Note over O: Specialists POST push notifications to /a2a/callback
-        alt needs_synthesis=true
-            O-->>F: SSE: status_update ("Synthesizing...")
-            O-->>F: SSE: artifact_update (synthesized chunks)
-        else needs_synthesis=false
-            O-->>F: SSE: artifact_update (section header + response A)
-            O-->>F: SSE: artifact_update (section header + response B)
-        end
-        O-->>F: SSE: status_update (COMPLETED)
+    par Driver dispatches A2A
+        O->>S1: SendMessage(return_immediately=true, push_config)
+        S1-->>O: 200 OK
+    and
+        O->>S2: SendMessage(return_immediately=true, push_config)
+        S2-->>O: 200 OK
     end
+
+    S1->>WH: POST /a2a/callback (chunks)
+    WH-->>F: data: specialist_chunk (activity)
+    S1->>WH: POST /a2a/callback (COMPLETED)
+    WH->>O: Command(resume={interrupt_1: resp1})
+    Note over O: branch 1 resumes; re-pauses (branch 2 pending)
+
+    S2->>WH: POST /a2a/callback (COMPLETED)
+    WH->>O: Command(resume={interrupt_2: resp2})
+    Note over O: branch 2 resumes → all done
+
+    alt needs_synthesis=true
+        O-->>F: data: status (synthesizing)
+        O-->>F: data: token ... (unified answer)
+    else needs_synthesis=false
+        O-->>F: data: status (assembling)
+        O-->>F: data: token ... (section headers + responses)
+    end
+    O-->>F: data: done (final_response)
 ```
 
-### Frontend A2A Client
+### Frontend SSE Client
 
-The frontend uses the `@a2a-js/sdk` to create a client and stream messages:
+The frontend consumes the SSE stream with a plain `fetch` + `ReadableStream` parser (see `chat-stream.ts`):
 
 ```typescript
-import { ClientFactory, type Client } from '@a2a-js/sdk/client'
+import { streamChat } from '@/lib/chat-stream'
 
-const clientFactory = new ClientFactory()
-const client = await clientFactory.createFromUrl('http://localhost:8000')
-
-// Stream a message
-const stream = client.sendMessageStream({
-  message: {
-    messageId: uuid(),
-    role: 1, // USER
-    contextId: conversationId,
-    parts: [{ content: { $case: 'text', value: userMessage } }],
-  },
-})
-
-for await (const event of stream) {
-  switch (event.payload?.$case) {
-    case 'task':           // Task created
-    case 'statusUpdate':   // Status change (routing, working, completed)
-    case 'artifactUpdate': // Streamed response chunk
-    case 'message':        // Final message
+for await (const event of streamChat(baseUrl, userMessage, conversationId)) {
+  switch (event.type) {
+    case 'status':          // phase/lifecycle (routing, working, …)
+    case 'token':           // main-response chunk (append to markdown)
+    case 'specialist_chunk':// raw specialist chunk (activity trail)
+    case 'done':            // terminal
+    case 'error':           // failure
   }
 }
 ```
 
-### Backend A2A Server
+### Specialists: A2A Servers
 
-The backend uses `a2a-sdk` to mount A2A routes on FastAPI:
-
-```python
-from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
-from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
-from a2a.server.routes.rest_routes import create_rest_routes
-from a2a.server.routes.agent_card_routes import create_agent_card_routes
-
-add_a2a_routes_to_fastapi(
-    app,
-    agent_card_routes=create_agent_card_routes(agent_card),
-    jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url='/a2a/jsonrpc'),
-    rest_routes=create_rest_routes(request_handler, path_prefix='/a2a'),
-)
-```
-
-The `DefaultRequestHandler` ties together the executor, task store, and agent card:
+The specialists remain full A2A servers (using `a2a-sdk`). The `DefaultRequestHandler` ties together the executor, task store, agent card, and push-notification sender:
 
 ```python
 request_handler = DefaultRequestHandler(
-    agent_executor=executor,        # OrchestratorExecutor or GenericSpecialistExecutor
+    agent_executor=executor,        # GenericSpecialistExecutor
     task_store=DatabaseTaskStore(engine),
     agent_card=agent_card,
     push_config_store=push_config_store,
+    push_sender=BasePushNotificationSender(...),  # POSTs StreamResponse to the orchestrator webhook
 )
 ```
+
+The orchestrator calls them as an A2A **client** with `return_immediately=True` + a `TaskPushNotificationConfig` pointing at its own `/a2a/callback` webhook.
 
 ---
 
@@ -239,49 +214,48 @@ This allows the frontend to render text as it streams in, rather than waiting fo
 
 ## Push Notifications (Async Callback Pattern)
 
-The A2A protocol supports **push notifications** for disconnected/async scenarios. Nimbus Chat uses this pattern for all orchestrator→specialist communication.
+The A2A protocol supports **push notifications** for disconnected/async scenarios. Nimbus Chat uses this pattern for all orchestrator→specialist communication, combined with **LangGraph interrupts** on the orchestrator side.
 
 ### How It Works
 
 ```mermaid
 sequenceDiagram
-    participant O as Orchestrator
-    participant CM as CallbackManager
+    participant O as Orchestrator (StateGraph)
+    participant D as GraphSession driver
     participant S as Specialist
     participant WH as Webhook /a2a/callback
 
-    O->>CM: create_queue(callback_token)
-    O->>S: SendMessage(return_immediately=true, push_config={url, token})
-    S-->>O: 200 OK (initial Task)
+    Note over O: specialist_wait node calls interrupt()<br/>graph PAUSES (SQLite checkpoint)
+    D->>S: SendMessage(return_immediately=true, push_config={url, token})
+    S-->>D: 200 OK (initial Task)
     Note over S: Specialist works in background
-    Note over O: Orchestrator connection freed
 
     loop Background processing
         S->>WH: POST /a2a/callback (StreamResponse JSON)
         Note right of WH: Header: X-A2A-Notification-Token
-        WH->>CM: push_event(token, parsed StreamResponse)
-        CM->>O: queue.get() → event
-        O->>O: relay to client SSE
+        WH->>D: handle_push_event(token, event)
+        D-->>D: relay specialist_chunk to SSE (activity trail)
     end
 
     S->>WH: POST /a2a/callback (terminal status)
-    WH->>CM: push_event(token, terminal event)
-    CM->>O: queue.get() → COMPLETED
-    O->>CM: remove_queue(token)
+    WH->>D: resume_queue.put(Command(resume={interrupt_id: response}))
+    D->>O: astream(Command(resume=...))
+    Note over O: branch resumes; re-pauses if other interrupts pending
 ```
 
 ### Key Components
 
 | Component | File | Role |
 |---|---|---|
-| `CallbackManager` | `app/orchestrator/callback.py` | In-memory `token → asyncio.Queue` registry |
-| Webhook endpoint | `POST /a2a/callback` on orchestrator | Receives push notifications, routes to queue |
-| `BasePushNotificationSender` | A2A SDK (on specialist) | POSTs `StreamResponse` events to webhook URL |
+| `GraphSession` | `app/orchestrator/session.py` | Driver loop: runs graph, dispatches A2A, bridges webhook→`Command(resume)` |
+| `SessionRegistry` | `app/orchestrator/session.py` | Maps callback tokens → active sessions (for webhook dispatch) |
+| Webhook endpoint | `POST /a2a/callback` on orchestrator | Receives push notifications, relays chunks, resumes graph |
+| `BasePushNotificationSender` | A2A SDK (on specialist) | POSTs `StreamResponse` events to the webhook URL |
 | `TaskPushNotificationConfig` | A2A proto | Contains `url` + `token` for callbacks |
 
 ### Request Configuration
 
-The orchestrator sends `SendMessage` with:
+The orchestrator (as A2A client) sends `SendMessage` with:
 
 ```python
 SendMessageRequest(
@@ -296,12 +270,7 @@ SendMessageRequest(
 )
 ```
 
-### Toggle: Sync vs Async
-
-```env
-ASYNC_SPECIALIST_MODE=true   # Push notifications (default) — no held connections
-ASYNC_SPECIALIST_MODE=false  # Streaming SSE — simpler, holds connections open
-```
+When the specialist reaches a terminal state, the webhook resumes the paused graph interrupt with `Command(resume={interrupt_id: response})`. With multiple specialists, the graph pauses with **multiple interrupts** that are resumed **one at a time** as each specialist posts back (partial resume).
 
 ---
 
@@ -311,10 +280,11 @@ The A2A `context_id` field is used as the LangGraph `thread_id` across the syste
 
 | Component | Thread ID | Purpose |
 |---|---|---|
+| **Orchestrator graph** | `{contextId}:orch:{turn_id}` | Per-turn graph state + interrupt checkpoints (isolated per turn) |
 | Router agent | `{contextId}:route` | Routing decision history |
 | Responder agent | `{contextId}:respond` | Direct response history |
 | Synthesizer agent | `{contextId}:synthesize` | Synthesis history |
 | Travel specialist | `{contextId}:travel_specialist` | Travel conversation history |
 | Nutrition specialist | `{contextId}:nutrition_specialist` | Nutrition conversation history |
 
-The frontend generates a stable UUID per conversation and sends it as `contextId` on every message. This enables multi-turn conversations with full context retention.
+The frontend generates a stable UUID per conversation and sends it as `context_id` on every message. This enables multi-turn conversations with full context retention. The orchestrator graph uses a fresh per-turn thread (so each turn's interrupts/state don't bleed into the next), while the nested agents reuse stable thread IDs for memory.
