@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -194,6 +195,35 @@ class GenericSpecialistExecutor(AgentExecutor):
 
         artifact_id = f'{task_id}-{self.config.table_name_prefix}-response'
         first_chunk = True
+
+        # Buffer tokens and flush in batches to avoid one push notification
+        # (HTTP POST to the orchestrator webhook) per token. We flush when the
+        # buffer exceeds FLUSH_CHARS OR FLUSH_INTERVAL seconds have elapsed.
+        FLUSH_CHARS = 1200
+        FLUSH_INTERVAL = 1.5
+        buffer: list[str] = []
+        buffer_len = 0
+        last_flush = time.monotonic()
+
+        async def flush(force: bool = False) -> None:
+            nonlocal first_chunk, buffer, buffer_len, last_flush
+            if not buffer:
+                return
+            if not force and buffer_len < FLUSH_CHARS and (time.monotonic() - last_flush) < FLUSH_INTERVAL:
+                return
+            await updater.add_artifact(
+                artifact_id=artifact_id,
+                name=self.config.artifact_name,
+                parts=[Part(text=''.join(buffer))],
+                append=not first_chunk,
+                last_chunk=False,
+                metadata={'source': self.config.table_name_prefix},
+            )
+            first_chunk = False
+            buffer = []
+            buffer_len = 0
+            last_flush = time.monotonic()
+
         async for event in self._get_agent().astream_events(
             {
                 'messages': [
@@ -221,15 +251,12 @@ class GenericSpecialistExecutor(AgentExecutor):
                 text = text()
                 if not text:
                     continue
-            await updater.add_artifact(
-                artifact_id=artifact_id,
-                name=self.config.artifact_name,
-                parts=[Part(text=text)],
-                append=not first_chunk,
-                last_chunk=False,
-                metadata={'source': self.config.table_name_prefix},
-            )
-            first_chunk = False
+            buffer.append(text)
+            buffer_len += len(text)
+            await flush()
+
+        # Flush any remaining buffered text.
+        await flush(force=True)
 
         await updater.complete(
             _agent_message(

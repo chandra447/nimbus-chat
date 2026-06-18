@@ -59,6 +59,7 @@ type ActivityEvent = {
   icon: 'task' | 'status' | 'artifact' | 'message' | 'route' | 'search'
   label: string
   detail: string
+  specialistName?: string
 }
 
 type ChatMessage = {
@@ -69,6 +70,8 @@ type ChatMessage = {
   phase?: Phase
   events?: ActivityEvent[]
   specialistName?: string
+  // Per-specialist accumulated raw text (for the live activity preview).
+  specialistStreams?: Record<string, string>
 }
 
 const starterPrompts = [
@@ -507,7 +510,7 @@ export function HomePage() {
               messages: [
                 ...c.messages,
                 { id: uuidv4(), role: 'user', content },
-                { id: uuidv4(), role: 'assistant', content: '', status: 'streaming', phase: 'idle', events: [] },
+                { id: uuidv4(), role: 'assistant', content: '', status: 'streaming', phase: 'idle', events: [], specialistStreams: {} },
               ],
               updatedAt: Date.now(),
             }
@@ -591,12 +594,17 @@ export function HomePage() {
         }
 
         if (phase === 'specialist_done') {
-          pushEvent({
-            kind: 'message',
-            icon: 'message',
-            label: specialistName ? `${specialistName} completed` : 'Specialist completed',
-            detail: text,
-          })
+          // Flip the specialist's live-stream event to "completed".
+          if (specialistName) {
+            updateLastAssistant((message) => ({
+              ...message,
+              events: (message.events ?? []).map((e) =>
+                e.kind === 'artifact' && e.specialistName === specialistName
+                  ? { ...e, label: `${specialistName} responded`, detail: 'Response complete.' }
+                  : e,
+              ),
+            }))
+          }
           return
         }
 
@@ -629,30 +637,54 @@ export function HomePage() {
       }
 
       case 'specialist_chunk': {
-        updateLastAssistant((message) => ({
-          ...message,
-          phase: message.phase === 'streaming' ? message.phase : 'working',
-          specialistName: event.specialist_name ?? message.specialistName,
-          events: [
-            ...(message.events ?? []),
-            {
+        // Accumulate per-specialist text into a single rolling "live" activity
+        // event (rather than one event per chunk). The event's detail shows a
+        // truncated, growing preview so the user sees progress without noise.
+        const sname = event.specialist_name
+        updateLastAssistant((message) => {
+          const streams = { ...(message.specialistStreams ?? {}) }
+          streams[sname] = (streams[sname] ?? '') + event.text
+          const preview = streams[sname].replace(/\s+/g, ' ').slice(0, 140)
+          const events = [...(message.events ?? [])]
+          // Find or create the single live-stream event for this specialist.
+          let idx = events.findIndex(
+            (e) => e.kind === 'artifact' && e.specialistName === sname,
+          )
+          if (idx === -1) {
+            events.push({
               id: uuidv4(),
               kind: 'artifact' as const,
               icon: 'artifact' as const,
-              label: `${event.specialist_name} chunk`,
-              detail: event.text.slice(0, 120),
-            },
-          ],
-        }))
+              label: `${sname} is responding`,
+              detail: preview,
+              specialistName: sname,
+            })
+          } else {
+            events[idx] = { ...events[idx], detail: preview }
+          }
+          return {
+            ...message,
+            phase: message.phase === 'streaming' ? message.phase : 'working',
+            specialistName: sname ?? message.specialistName,
+            specialistStreams: streams,
+            events,
+          }
+        })
         return
       }
 
       case 'done': {
+        // Mark any specialist live-stream events as completed.
         updateLastAssistant((message) => ({
           ...message,
           status: 'done',
           phase: 'done',
           content: event.final_response || message.content,
+          events: (message.events ?? []).map((e) =>
+            e.kind === 'artifact'
+              ? { ...e, label: `${e.specialistName ?? 'Specialist'} responded`, detail: 'Response complete.' }
+              : e,
+          ),
         }))
         pushEvent({
           kind: 'message',
