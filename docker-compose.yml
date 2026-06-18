@@ -1,0 +1,92 @@
+services:
+  orchestrator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["uv", "run", "python", "main.py"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      SQLITE_PATH: /data/nimbus-chat.db
+      ORCHESTRATOR_HOST: 0.0.0.0
+      ORCHESTRATOR_PORT: 8000
+      ORCHESTRATOR_PUBLIC_URL: http://localhost:8000
+      SPECIALIST_HOST: 0.0.0.0
+      SPECIALIST_PORT: 8001
+      SPECIALIST_PUBLIC_URL: http://localhost:8001
+      SPECIALIST_INTERNAL_URL: http://travel-specialist:8001
+      SPECIALIST_URL_REMAPS: http://localhost:8001=http://travel-specialist:8001,http://localhost:8002=http://nutrition-specialist:8002
+      TAVILY_ENABLED: ${TAVILY_ENABLED:-true}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SPECIALIST_CARD_REFRESH_TTL_SECONDS: ${SPECIALIST_CARD_REFRESH_TTL_SECONDS:-300}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend-data:/data
+
+  travel-specialist:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["uv", "run", "python", "specialist_main.py"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      SQLITE_PATH: /data/nimbus-chat.db
+      SPECIALIST_HOST: 0.0.0.0
+      SPECIALIST_PORT: 8001
+      SPECIALIST_TYPE: travel
+      SPECIALIST_PUBLIC_URL: http://localhost:8001
+      SPECIALIST_INTERNAL_URL: http://travel-specialist:8001
+      TAVILY_ENABLED: ${TAVILY_ENABLED:-true}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SPECIALIST_CARD_REFRESH_TTL_SECONDS: ${SPECIALIST_CARD_REFRESH_TTL_SECONDS:-300}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "8001:8001"
+    volumes:
+      - backend-data:/data
+
+  nutrition-specialist:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["uv", "run", "python", "specialist_main.py"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      SQLITE_PATH: /data/nimbus-chat.db
+      SPECIALIST_HOST: 0.0.0.0
+      SPECIALIST_PORT: 8002
+      SPECIALIST_TYPE: nutrition
+      SPECIALIST_PUBLIC_URL: http://localhost:8002
+      SPECIALIST_INTERNAL_URL: http://nutrition-specialist:8002
+      TAVILY_ENABLED: ${TAVILY_ENABLED:-true}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SPECIALIST_CARD_REFRESH_TTL_SECONDS: ${SPECIALIST_CARD_REFRESH_TTL_SECONDS:-300}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "8002:8002"
+    volumes:
+      - backend-data:/data
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_ORCHESTRATOR_BASE_URL: ${VITE_ORCHESTRATOR_BASE_URL:-http://localhost:8000}
+    depends_on:
+      - orchestrator
+    ports:
+      - "3000:80"
+
+volumes:
+  backend-data:
