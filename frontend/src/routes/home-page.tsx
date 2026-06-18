@@ -284,7 +284,7 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
             {/* Bottom glow — emphasizes the latest buffer */}
             <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-10 bg-gradient-to-t from-blue-500/10 to-transparent" />
 
-            <div className="relative z-0 h-full overflow-y-auto px-4 py-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <div ref={previewRef} className="relative z-0 h-full overflow-y-auto px-4 py-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {hasStreams ? (
                 <div className="space-y-3">
                   {streamEntries.map(([name, text]) => (
