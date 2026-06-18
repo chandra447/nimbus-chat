@@ -111,6 +111,7 @@ class OrchestratorExecutor(AgentExecutor):
                 )
                 await self._stream_parallel_specialist_response(
                     specialists=decision.specialists,
+                    needs_synthesis=decision.needs_synthesis,
                     user_input=user_input,
                     task_id=task_id,
                     context_id=context_id,
@@ -304,18 +305,49 @@ class OrchestratorExecutor(AgentExecutor):
         self,
         *,
         specialists: list,
+        needs_synthesis: bool,
         user_input: str,
         task_id: str,
         context_id: str,
         updater: TaskUpdater,
     ) -> None:
-        """Fan out to multiple specialists in parallel, then synthesize.
+        """Fan out to multiple specialists in parallel.
 
-        1. Call all specialists concurrently.
-        2. Collect each specialist's full response.
-        3. Synthesize a unified response and stream it to the client.
+        When ``needs_synthesis`` is True: collect all responses, run the
+        synthesizer LLM, and stream a unified answer (extra LLM call).
+
+        When ``needs_synthesis`` is False: stream each specialist's response
+        directly to the client with a section header — no extra LLM call.
+        Responses are emitted as each specialist completes (not waiting for
+        all to finish) via ``asyncio.as_completed``.
         """
-        # --- Fan out ---
+        if needs_synthesis:
+            await self._fan_out_with_synthesis(
+                specialists=specialists,
+                user_input=user_input,
+                task_id=task_id,
+                context_id=context_id,
+                updater=updater,
+            )
+        else:
+            await self._fan_out_no_synthesis(
+                specialists=specialists,
+                user_input=user_input,
+                task_id=task_id,
+                context_id=context_id,
+                updater=updater,
+            )
+
+    async def _fan_out_with_synthesis(
+        self,
+        *,
+        specialists: list,
+        user_input: str,
+        task_id: str,
+        context_id: str,
+        updater: TaskUpdater,
+    ) -> None:
+        """Collect all specialist responses, synthesize, stream unified answer."""
         tasks = [
             self._call_single_specialist(
                 specialist_name=s.name,
@@ -333,13 +365,12 @@ class OrchestratorExecutor(AgentExecutor):
         for i, result in enumerate(results):
             name = specialists[i].name
             if isinstance(result, Exception):
-                err_msg = f'{result}'
                 await updater.update_status(
                     TaskState.TASK_STATE_WORKING,
                     message=agent_message(
                         task_id=task_id,
                         context_id=context_id,
-                        text=f'{name} failed: {err_msg[:200]}',
+                        text=f'{name} failed: {result}',
                     ),
                 )
             else:
@@ -355,7 +386,6 @@ class OrchestratorExecutor(AgentExecutor):
             )
             return
 
-        # --- Synthesize ---
         names = [name for name, _ in specialist_responses]
         await updater.update_status(
             TaskState.TASK_STATE_WORKING,
@@ -386,7 +416,6 @@ class OrchestratorExecutor(AgentExecutor):
             )
             first_chunk = False
 
-        # Record the exchange for conversation continuity.
         full_synthesized_response = ''.join(synthesized_text)
         if full_synthesized_response:
             await self.responder.record_exchange(
@@ -400,6 +429,91 @@ class OrchestratorExecutor(AgentExecutor):
                 task_id=task_id,
                 context_id=context_id,
                 text=f'Synthesized response from {", ".join(names)} completed.',
+            )
+        )
+
+    async def _fan_out_no_synthesis(
+        self,
+        *,
+        specialists: list,
+        user_input: str,
+        task_id: str,
+        context_id: str,
+        updater: TaskUpdater,
+    ) -> None:
+        """Stream each specialist's response directly with section headers.
+
+        No extra LLM call — saves tokens. Responses are emitted as each
+        specialist completes (via ``asyncio.as_completed``).
+        """
+        artifact_id = f'{task_id}-parallel-response'
+        artifact_created = False
+        all_responses: list[str] = []
+
+        # Build coroutines keyed by specialist name for status messages.
+        coros = {
+            s.name: self._call_single_specialist(
+                specialist_name=s.name,
+                specialist_url=s.url,
+                user_input=user_input,
+                task_id=task_id,
+                context_id=context_id,
+                updater=updater,
+            )
+            for s in specialists
+        }
+
+        # Process specialists as they complete.
+        pending = {asyncio.create_task(coro, name=name): name
+                  for name, coro in coros.items()}
+
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                name = task.get_name()
+                try:
+                    specialist_name, response = await task
+                except Exception as exc:
+                    await updater.update_status(
+                        TaskState.TASK_STATE_WORKING,
+                        message=agent_message(
+                            task_id=task_id,
+                            context_id=context_id,
+                            text=f'{name} failed: {exc}',
+                        ),
+                    )
+                    continue
+
+                # Emit a section header + the specialist's full response.
+                header = f'## {specialist_name}\n\n'
+                chunk = header + response + '\n\n---\n\n'
+                all_responses.append(chunk)
+
+                await updater.add_artifact(
+                    artifact_id=artifact_id,
+                    name='parallel-response',
+                    parts=[Part(text=chunk)],
+                    append=artifact_created,
+                    last_chunk=False,
+                    metadata={'source': 'specialist', 'specialist_name': specialist_name},
+                )
+                artifact_created = True
+
+        if all_responses:
+            combined = ''.join(all_responses)
+            await self.responder.record_exchange(
+                user_input=user_input,
+                assistant_response=combined,
+                thread_id=context_id,
+            )
+
+        await updater.complete(
+            agent_message(
+                task_id=task_id,
+                context_id=context_id,
+                text=f'Responses from {len(specialists)} specialists completed.',
             )
         )
 

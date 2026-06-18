@@ -40,7 +40,19 @@ class RouteDecision(BaseModel):
             'List of specialists to route to. Include ALL specialists whose skills, tags, '
             'or examples are relevant. Can be 0 (no routing), 1 (single routing), or 2+ '
             '(parallel fan-out). When multiple are selected, the orchestrator calls them '
-            'all in parallel and synthesizes a combined response.'
+            'all in parallel.'
+        ),
+    )
+    needs_synthesis: bool = Field(
+        default=False,
+        description=(
+            'Only relevant when 2+ specialists are selected. Set to True if the '
+            "specialists' advice overlaps, conflicts, or needs to be reconciled into "
+            'a single unified answer (e.g. a budget constraint that spans both domains). '
+            'Set to False if the specialists address independent aspects of the request '
+            'and their responses can be presented side-by-side without reconciliation '
+            '(e.g. a travel itinerary + a separate meal plan). When False, each '
+            "specialist's response is streamed directly with a section header — no extra LLM call."
         ),
     )
     rationale: str = Field(default='')
@@ -86,9 +98,16 @@ class OrchestratorRouter:
                     'select the nutrition specialist.\n'
                     '3. If a request spans BOTH domains (e.g. "plan a healthy trip to Tokyo" or '
                     '"create a nutritious meal plan for my vacation"), select BOTH specialists. '
-                    'The orchestrator will fan out to all selected specialists in parallel and '
-                    'synthesize a combined response.\n'
+                    'The orchestrator will fan out to all selected specialists in parallel.\n'
                     '4. If no specialist is relevant, set should_route=false.\n\n'
+                    'SYNTHESIS DECISION (only when 2+ specialists are selected):\n'
+                    '- Set needs_synthesis=true if the specialists\' advice OVERLAPS or CONFLICTS and '
+                    'needs reconciliation into a single answer. Examples: a shared budget across '
+                    'travel and food, or optimizing a meal plan around a specific travel schedule.\n'
+                    '- Set needs_synthesis=false if the specialists address INDEPENDENT aspects '
+                    'that can be presented side-by-side. Examples: a travel itinerary + a separate '
+                    'meal plan with no shared constraints.\n'
+                    '- When in doubt, prefer false — it saves an extra LLM call and is usually fine.\n\n'
                     'IMPORTANT: When selecting specialists, use the EXACT name and URL from the '
                     'registered specialist list. Do not make up URLs.\n'
                     'When a request clearly involves multiple specialist domains, ALWAYS select '
