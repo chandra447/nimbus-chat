@@ -169,10 +169,12 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
   const events = message.events ?? []
   const phase = message.phase ?? 'idle'
   const specialistName = message.specialistName
+  const streams = message.specialistStreams ?? {}
   const active = message.status === 'streaming' && phase !== 'done' && phase !== 'error'
   const [expanded, setExpanded] = useState(
     phase === 'analyzing' || phase === 'routing' || phase === 'working',
   )
+  const previewRef = useRef<HTMLDivElement | null>(null)
 
   // keep expanded while thinking, auto-collapse once responding
   useEffect(() => {
@@ -183,87 +185,146 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
     }
   }, [phase])
 
-  if (!events.length && phase === 'idle') return null
+  // Auto-scroll the live preview to the bottom as new text streams in.
+  useEffect(() => {
+    if (previewRef.current) {
+      previewRef.current.scrollTop = previewRef.current.scrollHeight
+    }
+  }, [streams, expanded])
+
+  if (!events.length && phase === 'idle' && !Object.keys(streams).length) return null
 
   const PhaseIcon = phaseIcon(phase)
+  const streamEntries = Object.entries(streams)
+  const hasStreams = streamEntries.length > 0
   const lastEvent = events[events.length - 1]
 
   const summary = (() => {
     if (phase === 'routing') return specialistName ? `Delegated to ${specialistName}` : 'Routed to specialist'
     if (phase === 'streaming')
       return specialistName
-        ? `${specialistName} is responding${events.filter((e) => e.kind === 'artifact').length ? ` · ${events.filter((e) => e.kind === 'artifact').length} chunks` : ''}`
-        : `Streaming response${events.filter((e) => e.kind === 'artifact').length ? ` · ${events.filter((e) => e.kind === 'artifact').length} chunks` : ''}`
-    if (phase === 'done') return specialistName ? `${specialistName} completed · ${events.length} events` : `Completed · ${events.length} events`
+        ? `${specialistName} is responding`
+        : 'Streaming response'
+    if (phase === 'done') return specialistName ? `${specialistName} completed` : 'Completed'
     if (phase === 'working') return specialistName ? `${specialistName} is working` : 'Specialist is working'
     if (phase === 'analyzing') return 'Analyzing request'
     return lastEvent?.label ?? 'Working'
   })()
 
   return (
-    <div className="mb-3 rounded-2xl border border-white/10 bg-white/[0.03]">
+    <div
+      className={cn(
+        'mb-3 overflow-hidden rounded-[20px] border border-white/15 bg-white/[0.06]',
+        'shadow-[0_8px_32px_rgba(0,0,0,0.25)] backdrop-blur-2xl backdrop-saturate-150',
+        'transition-all duration-300',
+      )}
+    >
+      {/* Header */}
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left"
+        className="flex w-full items-center gap-2.5 px-4 py-3 text-left"
       >
         <span
           className={cn(
-            'flex h-6 w-6 shrink-0 items-center justify-center rounded-lg',
-            active ? 'bg-blue-500/15 text-blue-300' : 'bg-white/5 text-zinc-300',
+            'flex h-7 w-7 shrink-0 items-center justify-center rounded-xl',
+            active
+              ? 'bg-blue-500/20 text-blue-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.15)]'
+              : 'bg-white/8 text-zinc-300',
           )}
         >
           {active ? (
-            <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+            <LoaderCircle className="h-4 w-4 animate-spin" />
           ) : (
-            <PhaseIcon className="h-3.5 w-3.5" />
+            <PhaseIcon className="h-4 w-4" />
           )}
         </span>
-        <span className="text-[13px] font-medium text-zinc-200">{phaseLabel[phase]}</span>
+        <span className="text-[13px] font-semibold tracking-tight text-zinc-100">{phaseLabel[phase]}</span>
         {specialistName && (phase === 'routing' || phase === 'working' || phase === 'streaming' || phase === 'done') ? (
-          <span className="flex items-center gap-1.5">
-            <Badge variant="outline" className="border-violet-400/30 bg-violet-500/10 text-[10px] text-violet-200">
-              {specialistName}
-            </Badge>
+          <span className="rounded-full border border-violet-400/25 bg-violet-500/15 px-2 py-0.5 text-[10px] font-medium text-violet-100">
+            {specialistName}
           </span>
         ) : null}
-        <span className="truncate text-[12px] text-muted-foreground">{summary}</span>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-zinc-400">{summary}</span>
         <span className="ml-auto flex items-center gap-2">
           {active ? (
-            <span className="flex items-center gap-1">
+            <span className="flex items-center gap-1.5 rounded-full bg-blue-500/10 px-2 py-0.5">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
-              <span className="text-[11px] text-blue-300">live</span>
+              <span className="text-[10px] font-medium uppercase tracking-wider text-blue-300">live</span>
             </span>
           ) : null}
           <ChevronDown
-            className={cn('h-4 w-4 text-muted-foreground transition-transform', expanded && 'rotate-180')}
+            className={cn('h-4 w-4 text-zinc-400 transition-transform duration-200', expanded && 'rotate-180')}
           />
         </span>
       </button>
 
+      {/* Live preview — auto-scrolling streaming text (iOS glass console) */}
+      {hasStreams ? (
+        <div className="px-4 pb-1">
+          <div
+            ref={previewRef}
+            className={cn(
+              'relative overflow-hidden rounded-2xl border border-white/10 bg-black/25',
+              'backdrop-blur-md',
+              expanded ? 'max-h-[280px] overflow-y-auto' : 'max-h-[84px]',
+            )}
+          >
+            {/* fade-to-transparent gradient at the top when collapsed */}
+            {!expanded ? (
+              <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-black/40 to-transparent" />
+            ) : null}
+            <div className="space-y-2 px-3.5 py-3">
+              {streamEntries.map(([name, text]) => (
+                <div key={name} className="min-w-0">
+                  <div className="mb-1 flex items-center gap-1.5">
+                    <span className="h-1.5 w-1.5 rounded-full bg-blue-400/80" />
+                    <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{name}</span>
+                  </div>
+                  <p className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-300">
+                    {text || '…'}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Expanded activity log — what's happening behind the scenes */}
       <AnimatePresence initial={false}>
         {expanded ? (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
+            transition={{ duration: 0.22, ease: 'easeOut' }}
             className="overflow-hidden"
           >
-            <div className="space-y-1 border-t border-white/5 px-3.5 py-2.5">
-              {events.map((event) => (
-                <div key={event.id} className="flex items-start gap-2.5 py-1">
-                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-white/[0.04]">
-                    <ActivityIcon kind={event.kind} />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[12px] font-medium text-zinc-300">{event.label}</div>
-                    {event.detail ? (
-                      <div className="truncate text-[11px] text-muted-foreground">{event.detail}</div>
-                    ) : null}
+            <div className="border-t border-white/8 px-4 py-3">
+              <div className="mb-2 flex items-center gap-2 px-0.5">
+                <span className="text-[10px] font-semibold uppercase tracking-[0.15em] text-zinc-500">Activity</span>
+                <span className="h-px flex-1 bg-white/8" />
+                <span className="text-[10px] text-zinc-500">{events.length} events</span>
+              </div>
+              <div className="space-y-0.5">
+                {events.map((event) => (
+                  <div key={event.id} className="flex items-start gap-2.5 rounded-lg px-1.5 py-1 transition hover:bg-white/[0.04]">
+                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-white/[0.05]">
+                      <ActivityIcon kind={event.kind} />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[12px] font-medium text-zinc-300">{event.label}</div>
+                      {event.detail ? (
+                        <div className="truncate text-[11px] text-zinc-500">{event.detail}</div>
+                      ) : null}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))}
+                {!events.length ? (
+                  <div className="px-1.5 py-2 text-[12px] text-zinc-500">Waiting for activity…</div>
+                ) : null}
+              </div>
             </div>
           </motion.div>
         ) : null}

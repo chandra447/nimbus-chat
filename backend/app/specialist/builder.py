@@ -199,8 +199,8 @@ class GenericSpecialistExecutor(AgentExecutor):
         # Buffer tokens and flush in batches to avoid one push notification
         # (HTTP POST to the orchestrator webhook) per token. We flush when the
         # buffer exceeds FLUSH_CHARS OR FLUSH_INTERVAL seconds have elapsed.
-        FLUSH_CHARS = 1200
-        FLUSH_INTERVAL = 1.5
+        FLUSH_CHARS = 2000
+        FLUSH_INTERVAL = 2.0
         buffer: list[str] = []
         buffer_len = 0
         last_flush = time.monotonic()
