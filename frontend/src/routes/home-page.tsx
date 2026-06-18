@@ -25,7 +25,7 @@ import {
   Waves,
   X,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
 import { Badge } from '@/components/ui/badge'
@@ -73,6 +73,8 @@ type ChatMessage = {
   specialistName?: string
   // Per-specialist accumulated raw text (for the live activity preview).
   specialistStreams?: Record<string, string>
+  // Most recent chunk for each specialist; rendered with a soft live highlight.
+  specialistLatestChunks?: Record<string, string>
 }
 
 const starterPrompts = [
@@ -92,21 +94,22 @@ const phaseLabel: Record<Phase, string> = {
   error: 'Error',
 }
 
-function phaseIcon(phase: Phase) {
+function PhaseGlyph({ phase, className }: { phase: Phase; className?: string }) {
   switch (phase) {
     case 'routing':
-      return Route
+      return <Route className={className} />
     case 'streaming':
-      return CircleDot
+      return <CircleDot className={className} />
     case 'done':
-      return Check
+      return <Check className={className} />
     case 'error':
-      return CircleDot
+      return <CircleDot className={className} />
     default:
-      return Brain
+      return <Brain className={className} />
   }
 }
 
+/* eslint-disable @typescript-eslint/no-unused-vars */
 function Markdown({ content }: { content: string }) {
   return (
     <div className="text-[15px] leading-7 text-zinc-100">
@@ -147,6 +150,51 @@ function Markdown({ content }: { content: string }) {
     </div>
   )
 }
+
+function StreamMarkdown({ content, className }: { content: string; className?: string }) {
+  if (!content.trim()) return null
+
+  return (
+    <div className={cn('min-w-0 text-[12px] leading-relaxed text-zinc-100', className)}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ node, ...props }) => <h1 className="mt-2 mb-1 text-sm font-semibold tracking-tight text-zinc-100" {...props} />,
+          h2: ({ node, ...props }) => <h2 className="mt-2 mb-1 text-[13px] font-semibold tracking-tight text-zinc-100" {...props} />,
+          h3: ({ node, ...props }) => <h3 className="mt-2 mb-1 text-[12px] font-semibold text-zinc-100" {...props} />,
+          h4: ({ node, ...props }) => <h4 className="mt-1.5 mb-1 text-[12px] font-semibold text-zinc-100" {...props} />,
+          p: ({ node, ...props }) => <p className="my-1.5" {...props} />,
+          ul: ({ node, ...props }) => <ul className="my-1.5 list-disc space-y-0.5 pl-4" {...props} />,
+          ol: ({ node, ...props }) => <ol className="my-1.5 list-decimal space-y-0.5 pl-4" {...props} />,
+          li: ({ node, ...props }) => <li className="leading-relaxed" {...props} />,
+          a: ({ node, ...props }) => <a className="text-blue-300 underline underline-offset-2" target="_blank" rel="noreferrer" {...props} />,
+          strong: ({ node, ...props }) => <strong className="font-semibold text-white" {...props} />,
+          em: ({ node, ...props }) => <em className="italic text-zinc-200" {...props} />,
+          hr: ({ node, ...props }) => <hr className="my-2 border-white/10" {...props} />,
+          blockquote: ({ node, ...props }) => <blockquote className="my-1.5 border-l border-white/20 pl-3 italic text-zinc-300" {...props} />,
+          code: ({ node, className, children, ...props }) => (
+            <code className={cn('rounded bg-white/10 px-1 py-0.5 font-mono text-[11px]', className)} {...props}>
+              {children}
+            </code>
+          ),
+          pre: ({ node, ...props }) => <pre className="my-2 overflow-x-auto rounded-xl border border-white/10 bg-black/35 p-2.5 text-[11px]" {...props} />,
+          table: ({ node, ...props }) => (
+            <div className="my-2 overflow-x-auto rounded-xl border border-white/10 bg-black/20">
+              <table className="w-full border-collapse text-[11px]" {...props} />
+            </div>
+          ),
+          thead: ({ node, ...props }) => <thead className="border-b border-white/15 bg-white/[0.03]" {...props} />,
+          th: ({ node, ...props }) => <th className="border-b border-white/15 px-2 py-1.5 text-left font-semibold" {...props} />,
+          td: ({ node, ...props }) => <td className="border-b border-white/10 px-2 py-1.5 align-top" {...props} />,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+/* eslint-enable @typescript-eslint/no-unused-vars */
 
 function CopyButton({ text, className }: { text: string; className?: string }) {
   const [copied, setCopied] = useState(false)
@@ -197,21 +245,24 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
   const events = message.events ?? []
   const phase = message.phase ?? 'idle'
   const specialistName = message.specialistName
-  const streams = message.specialistStreams ?? {}
+  const streams = useMemo(() => message.specialistStreams ?? {}, [message.specialistStreams])
+  const latestChunks = useMemo(() => message.specialistLatestChunks ?? {}, [message.specialistLatestChunks])
   const active = message.status === 'streaming' && phase !== 'done' && phase !== 'error'
   const [expanded, setExpanded] = useState(false)
   const previewRef = useRef<HTMLDivElement | null>(null)
 
-  // Auto-scroll the live preview to the bottom as new text streams in.
-  useEffect(() => {
-    if (previewRef.current) {
-      previewRef.current.scrollTop = previewRef.current.scrollHeight
-    }
-  }, [streams])
+  // Auto-scroll the actual scroll viewport to the bottom as markdown reflows.
+  useLayoutEffect(() => {
+    const el = previewRef.current
+    if (!el) return
+    const frame = requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [streams, latestChunks])
 
   if (!events.length && phase === 'idle' && !Object.keys(streams).length) return null
 
-  const PhaseIcon = phaseIcon(phase)
   const streamEntries = Object.entries(streams)
   const hasStreams = streamEntries.length > 0
   const lastEvent = events[events.length - 1]
@@ -253,7 +304,7 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
           {active ? (
             <LoaderCircle className="h-4 w-4 animate-spin" />
           ) : (
-            <PhaseIcon className="h-4 w-4" />
+            <PhaseGlyph phase={phase} className="h-4 w-4" />
           )}
         </span>
         <span className="text-[13px] font-semibold tracking-tight text-zinc-100">{phaseLabel[phase]}</span>
@@ -282,7 +333,6 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
       {hasStreams || active ? (
         <div className="px-4 pb-3">
           <div
-            ref={previewRef}
             className={cn(
               'relative h-[120px] overflow-hidden rounded-2xl border border-white/10',
               'bg-gradient-to-b from-white/[0.04] to-black/30',
@@ -314,21 +364,37 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
 
             <div ref={previewRef} className="relative z-0 h-full overflow-y-auto px-4 py-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {hasStreams ? (
-                <div className="space-y-3">
-                  {streamEntries.map(([name, text]) => (
-                    <div key={name} className="min-w-0">
-                      <div className="mb-1 flex items-center gap-1.5">
-                        <span className="h-1.5 w-1.5 rounded-full bg-blue-400/80" />
-                        <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{name}</span>
-                      </div>
-                      <p className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-100">
-                        {text || '…'}
-                        {active ? (
-                          <span className="ml-0.5 inline-block h-3.5 w-[7px] translate-y-0.5 animate-pulse rounded-[1px] bg-blue-400" />
+                <div className="space-y-3 pb-2">
+                  {streamEntries.map(([name, text]) => {
+                    const latest = latestChunks[name] ?? ''
+                    const stableText = latest && text.endsWith(latest) ? text.slice(0, -latest.length) : text
+                    return (
+                      <div key={name} className="min-w-0">
+                        <div className="sticky top-0 z-10 mb-1 flex items-center gap-1.5 bg-[#111827]/80 py-0.5 backdrop-blur-sm">
+                          <span className="h-1.5 w-1.5 rounded-full bg-blue-400/80" />
+                          <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{name}</span>
+                        </div>
+                        {stableText ? <StreamMarkdown content={stableText} className="opacity-85" /> : null}
+                        {latest ? (
+                          <motion.div
+                            key={`${name}-${text.length}`}
+                            initial={{ opacity: 0.35, y: 4 }}
+                            animate={{ opacity: 0.78, y: 0 }}
+                            transition={{ duration: 0.22, ease: 'easeOut' }}
+                            className="mt-1 rounded-xl border border-blue-300/10 bg-blue-400/[0.07] px-2.5 py-1.5 shadow-[0_0_24px_rgba(59,130,246,0.10)]"
+                          >
+                            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-[0.18em] text-blue-300/60">new</div>
+                            <StreamMarkdown content={latest} className="text-zinc-100/80" />
+                          </motion.div>
+                        ) : !stableText ? (
+                          <span className="text-[12px] text-zinc-500">…</span>
                         ) : null}
-                      </p>
-                    </div>
-                  ))}
+                        {active ? (
+                          <span className="mt-1 inline-block h-3.5 w-[7px] animate-pulse rounded-[1px] bg-blue-400/80" />
+                        ) : null}
+                      </div>
+                    )
+                  })}
                 </div>
               ) : (
                 <div className="flex h-full items-center">
@@ -453,7 +519,7 @@ export function HomePage() {
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
   const activeConversation = conversations.find((c) => c.id === activeConversationId) ?? conversations[0]
-  const messages = activeConversation?.messages ?? []
+  const messages = useMemo(() => activeConversation?.messages ?? [], [activeConversation?.messages])
 
   // Persist conversations to localStorage.
   useEffect(() => {
@@ -760,11 +826,13 @@ export function HomePage() {
         const sname = event.specialist_name
         updateLastAssistant((message) => {
           const streams = { ...(message.specialistStreams ?? {}) }
+          const latestChunks = { ...(message.specialistLatestChunks ?? {}) }
           streams[sname] = (streams[sname] ?? '') + event.text
+          latestChunks[sname] = event.text
           const preview = streams[sname].replace(/\s+/g, ' ').slice(0, 140)
           const events = [...(message.events ?? [])]
           // Find or create the single live-stream event for this specialist.
-          let idx = events.findIndex(
+          const idx = events.findIndex(
             (e) => e.kind === 'artifact' && e.specialistName === sname,
           )
           if (idx === -1) {
@@ -784,6 +852,7 @@ export function HomePage() {
             phase: message.phase === 'streaming' ? message.phase : 'working',
             specialistName: sname ?? message.specialistName,
             specialistStreams: streams,
+            specialistLatestChunks: latestChunks,
             events,
           }
         })
