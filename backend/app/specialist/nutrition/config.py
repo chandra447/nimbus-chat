@@ -31,7 +31,7 @@ nutrition_config = SpecialistConfig(
     table_name_prefix='nutrition_specialist',
     artifact_name='nutrition-plan',
     label='Nutritionist',
-    streaming=False,
+    streaming=True,
     skills=[
         SpecialistSkillSpec(
             id='meal_planning',
