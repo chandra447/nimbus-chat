@@ -14,6 +14,7 @@ Nimbus Chat demonstrates an **orchestrator-specialist architecture** where a cen
 - **Conversation Continuity** — Threaded sessions with LangGraph SQLite checkpointing; the orchestrator remembers specialist-routed turns across direct follow-ups.
 - **Streaming UI** — Real-time token streaming with an inline "thinking/activity" trail (Kimi-style), markdown rendering, and per-specialist attribution.
 - **OpenRouter + Tavily** — LLM via OpenRouter (`init_chat_model`), web research via Tavily — both configurable through environment variables.
+- **Distributed Tracing** — Every request across the orchestrator and all specialists is traced into a single HoneyHive session (LangChain auto-instrumented, W3C context propagation across A2A delegations). See [docs/tracing.md](docs/tracing.md).
 
 ---
 
@@ -230,6 +231,10 @@ nimbus-chat/
 | `ORCHESTRATOR_INTERNAL_URL` | `http://localhost:8000` | Internal URL that specialists use to POST push notifications back. |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins. |
 | `VITE_ORCHESTRATOR_BASE_URL` | `http://localhost:8000` | Frontend → orchestrator URL. |
+| `HH_API_KEY` | *(none)* | HoneyHive API key. Set to enable distributed tracing. |
+| `HH_PROJECT` | *(inferred)* | HoneyHive project name. |
+| `HH_ENABLE_TRACING` | `true` | Explicit on/off (defaults on when `HH_API_KEY` set). |
+| `OTEL_INSTRUMENTATION_A2A_SDK_ENABLED` | `false` | Disables A2A's own tracing — only LangChain traces go to HoneyHive. |
 
 ### LLM Model
 
@@ -434,6 +439,7 @@ That's it — the router will automatically consider the new specialist for rele
 - [A2A Protocol Guide](docs/a2a-protocol.md) — How A2A discovery, messaging, and streaming work
 - [Specialists Guide](docs/specialists.md) — Building, configuring, and registering specialist agents
 - [Development Guide](docs/development.md) — Local development, testing, and debugging
+- [Distributed Tracing](docs/tracing.md) — HoneyHive tracing across orchestrator + specialists
 
 ---
 

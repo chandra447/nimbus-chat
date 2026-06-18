@@ -37,6 +37,7 @@ from uuid import uuid4
 
 import httpx
 from a2a.client import ClientConfig, create_client
+from a2a.client.client import ClientCallContext
 from a2a.types.a2a_pb2 import (
     Message,
     Part,
@@ -51,6 +52,7 @@ from langgraph.types import Command
 
 from app.orchestrator.routing import OrchestratorResponder
 from app.settings import Settings
+from app.tracing import get_tracer, session_id_for
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,10 @@ class GraphSession:
         # RouteDecision dict (populated from graph state after route_node)
         self.route: dict[str, Any] | None = None
 
+        # Distributed tracing: one HoneyHive session per conversation.
+        self.tracer = get_tracer('orchestrator')
+        self.session_id = session_id_for(context_id)
+
         self._driver_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
@@ -108,7 +114,30 @@ class GraphSession:
         """Launch the driver coroutine in the background."""
         self._driver_task = asyncio.create_task(self._drive())
 
+    def _trace_context(self):
+        """Context manager wrapping the whole turn in one HoneyHive span.
+
+        Sets the conversation session_id in the OTel baggage so that every
+        child span (router, responder, synthesizer, and the specialist
+        dispatch) lands in the same HoneyHive session. Returns a no-op context
+        manager when tracing is disabled.
+        """
+        if self.tracer is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        from honeyhive.tracer.processing.context import enrich_span_context
+        return enrich_span_context(
+            event_name='orchestrator_turn',
+            inputs={'user_input': self.user_input, 'context_id': self.context_id},
+            session_id=self.session_id,
+            tracer_instance=self.tracer,
+        )
+
     async def _drive(self) -> None:
+        with self._trace_context():
+            await self._drive_inner()
+
+    async def _drive_inner(self) -> None:
         try:
             input_: Any = {
                 'user_input': self.user_input,
@@ -194,47 +223,90 @@ class GraphSession:
                 self._send_specialist_request(meta, callback_token)
             )
 
+    def _dispatch_trace_context(self, meta: dict[str, Any]):
+        """Span wrapping a single specialist dispatch (child of orchestrator_turn)."""
+        if self.tracer is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        from honeyhive.tracer.processing.context import enrich_span_context
+        return enrich_span_context(
+            event_name='call_specialist',
+            inputs={
+                'specialist_name': meta.get('specialist_name'),
+                'specialist_url': meta.get('specialist_url'),
+                'query': meta.get('query'),
+            },
+            session_id=self.session_id,
+            tracer_instance=self.tracer,
+        )
+
+    def _build_trace_call_context(self) -> ClientCallContext | None:
+        """Build an A2A ClientCallContext carrying injected trace headers.
+
+        ``ClientCallContext.service_parameters`` becomes the HTTP headers on
+        the outgoing JSON-RPC request, so the specialist can extract the W3C
+        traceparent + HoneyHive session baggage.
+        """
+        if self.tracer is None:
+            return None
+        from honeyhive.tracer.processing.context import inject_context_into_carrier
+        headers: dict[str, str] = {}
+        inject_context_into_carrier(headers, self.tracer)
+        if not headers:
+            return None
+        return ClientCallContext(service_parameters=headers)
+
     async def _send_specialist_request(
         self, meta: dict[str, Any], callback_token: str
     ) -> None:
-        """Send A2A SendMessage with return_immediately + push config."""
+        """Send A2A SendMessage with return_immediately + push config.
+
+        Wrapped in a HoneyHive ``call_specialist`` span, with the trace context
+        (W3C traceparent + session/project baggage) injected into the A2A
+        request headers so the specialist's spans become children of this span
+        in the same HoneyHive session.
+        """
         callback_url = f'{self.settings.orchestrator_internal_url}/a2a/callback'
-        try:
-            client = await create_client(
-                meta['specialist_url'],
-                client_config=ClientConfig(
-                    streaming=False,
-                    httpx_client=httpx.AsyncClient(timeout=300.0),
-                ),
-            )
-            request = SendMessageRequest(
-                message=Message(
-                    message_id=str(uuid4()),
-                    role=Role.ROLE_USER,
-                    context_id=meta.get('context_id', self.context_id),
-                    parts=[Part(text=meta['query'])],
-                ),
-                configuration=SendMessageConfiguration(
-                    return_immediately=True,
-                    task_push_notification_config=TaskPushNotificationConfig(
-                        url=callback_url,
-                        token=callback_token,
+        with self._dispatch_trace_context(meta):
+            try:
+                client = await create_client(
+                    meta['specialist_url'],
+                    client_config=ClientConfig(
+                        streaming=False,
+                        httpx_client=httpx.AsyncClient(timeout=300.0),
                     ),
-                ),
-            )
-            async for _event in client.send_message(request):
-                # The initial Task response — specialist continues in background.
-                pass
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                'Failed to dispatch A2A request to %s', meta.get('specialist_url')
-            )
-            # Resume the interrupt with an error so the graph isn't stuck.
-            interrupt_id = self.token_to_interrupt.get(callback_token)
-            if interrupt_id is not None:
-                await self.resume_queue.put(
-                    Command(resume={interrupt_id: '[specialist unavailable]'})
                 )
+                request = SendMessageRequest(
+                    message=Message(
+                        message_id=str(uuid4()),
+                        role=Role.ROLE_USER,
+                        context_id=meta.get('context_id', self.context_id),
+                        parts=[Part(text=meta['query'])],
+                    ),
+                    configuration=SendMessageConfiguration(
+                        return_immediately=True,
+                        task_push_notification_config=TaskPushNotificationConfig(
+                            url=callback_url,
+                            token=callback_token,
+                        ),
+                    ),
+                )
+                # Inject W3C trace context + HoneyHive session baggage into
+                # the outgoing A2A request headers so the specialist attaches.
+                call_ctx = self._build_trace_call_context()
+                async for _event in client.send_message(request, context=call_ctx):
+                    # The initial Task response — specialist continues in background.
+                    pass
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    'Failed to dispatch A2A request to %s', meta.get('specialist_url')
+                )
+                # Resume the interrupt with an error so the graph isn't stuck.
+                interrupt_id = self.token_to_interrupt.get(callback_token)
+                if interrupt_id is not None:
+                    await self.resume_queue.put(
+                        Command(resume={interrupt_id: '[specialist unavailable]'})
+                    )
 
     async def _finish(self) -> None:
         """Record the exchange for conversation continuity, then emit done."""

@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     tavily_api_key: str = Field(default='', alias='TAVILY_API_KEY')
     tavily_enabled: bool = Field(default=False, alias='TAVILY_ENABLED')
 
+    # Distributed tracing (HoneyHive). When hh_api_key is set, LangChain calls
+    # on both the orchestrator and specialists are traced into a single
+    # per-conversation HoneyHive session, with specialist spans linked as
+    # children of the orchestrator's dispatch span via W3C context propagation.
+    hh_api_key: str = Field(default='', alias='HH_API_KEY')
+    hh_project: str = Field(default='', alias='HH_PROJECT')
+    hh_enable_tracing: bool = Field(default=True, alias='HH_ENABLE_TRACING')
+
     specialist_card_refresh_ttl_seconds: int = Field(
         default=300,
         alias='SPECIALIST_CARD_REFRESH_TTL_SECONDS',

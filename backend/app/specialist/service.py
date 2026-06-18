@@ -16,6 +16,7 @@ from app.settings import Settings
 from app.specialist.agent_card import build_specialist_agent_card
 from app.specialist.config import SpecialistConfig
 from app.specialist.executor import LangChainSpecialistExecutor
+from app.tracing import get_tracer
 from nimbus_a2a import SpecialistServerConfig, create_specialist_app as create_specialist_app_sdk
 
 
@@ -48,7 +49,8 @@ def create_specialist_app(settings: Settings, config: SpecialistConfig) -> FastA
         push_notification_table=config.push_notification_table,
     )
 
-    return create_specialist_app_sdk(executor, agent_card, server=server)
+    tracer = get_tracer(f'specialist:{config.table_name_prefix}')
+    return create_specialist_app_sdk(executor, agent_card, server=server, tracer=tracer)
 
 
 # Backwards-compatible alias.

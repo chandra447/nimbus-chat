@@ -4,6 +4,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: ["uv", "run", "python", "main.py"]
+    env_file: backend/.env
     environment:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -33,6 +34,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: ["uv", "run", "python", "specialist_main.py"]
+    env_file: backend/.env
     environment:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -58,6 +60,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: ["uv", "run", "python", "specialist_main.py"]
+    env_file: backend/.env
     environment:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

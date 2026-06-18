@@ -63,6 +63,7 @@ def create_specialist_app(
     agent_card,
     *,
     server: SpecialistServerConfig,
+    tracer=None,
 ) -> FastAPI:
     """Build a FastAPI app running the specialist as an A2A server.
 
@@ -72,6 +73,11 @@ def create_specialist_app(
         agent_card: The team's A2A ``AgentCard``. Its ``streaming`` capability
             is patched to match ``executor.streaming``.
         server: Runtime wiring (DB url, public/internal URLs, CORS, table names).
+        tracer: Optional HoneyHive tracer for distributed tracing. When
+            provided, a middleware extracts the W3C trace context + session
+            baggage from incoming A2A request headers so the specialist's
+            spans become children of the orchestrator's dispatch span, all in
+            the same HoneyHive session. ``None`` disables tracing.
     """
     # One source of truth: the executor declares streaming; reflect it on the card.
     agent_card.capabilities.streaming = executor.streaming
@@ -120,6 +126,11 @@ def create_specialist_app(
         finally:
             await executor.shutdown()
             await engine.dispose()
+            if tracer is not None:
+                try:
+                    tracer.flush()
+                except Exception:  # noqa: BLE001
+                    pass
 
     app = FastAPI(
         title=getattr(agent_card, 'name', 'Nimbus Specialist'),
@@ -135,6 +146,9 @@ def create_specialist_app(
         allow_headers=['*'],
     )
 
+    if tracer is not None:
+        _add_distributed_trace_middleware(app, tracer)
+
     @app.get('/health')
     def healthcheck() -> dict[str, object]:
         return {
@@ -142,6 +156,7 @@ def create_specialist_app(
             'specialist_name': getattr(agent_card, 'name', 'specialist'),
             'streaming': executor.streaming,
             'public_url': server.public_url,
+            'tracing_enabled': tracer is not None,
         }
 
     @app.get('/api/specialist/agent-card')
@@ -165,3 +180,24 @@ def create_specialist_app(
         }
 
     return app
+
+
+def _add_distributed_trace_middleware(app: FastAPI, tracer) -> None:
+    """Extract incoming W3C trace context so specialist spans link to the caller.
+
+    Wraps every request in :func:`with_distributed_trace_context`, which reads
+    the ``traceparent`` + HoneyHive session/project baggage from the incoming
+    A2A request headers and attaches them as the current OTel context. All
+    spans created while handling the request (the specialist's LangChain agent
+    spans, auto-instrumented via openinference-langchain) then become children
+    of the orchestrator's ``call_specialist`` span and land in the same
+    HoneyHive session.
+    """
+    from honeyhive.tracer.processing.context import with_distributed_trace_context
+    from starlette.requests import Request
+
+    @app.middleware('http')
+    async def distributed_trace_middleware(request: Request, call_next):
+        headers = {k: v for k, v in request.headers.items()}
+        with with_distributed_trace_context(headers, tracer):
+            return await call_next(request)
