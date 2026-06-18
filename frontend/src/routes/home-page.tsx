@@ -171,26 +171,15 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
   const specialistName = message.specialistName
   const streams = message.specialistStreams ?? {}
   const active = message.status === 'streaming' && phase !== 'done' && phase !== 'error'
-  const [expanded, setExpanded] = useState(
-    phase === 'analyzing' || phase === 'routing' || phase === 'working',
-  )
+  const [expanded, setExpanded] = useState(false)
   const previewRef = useRef<HTMLDivElement | null>(null)
-
-  // keep expanded while thinking, auto-collapse once responding
-  useEffect(() => {
-    if (phase === 'streaming' || phase === 'done' || phase === 'error') {
-      setExpanded(false)
-    } else if (phase === 'analyzing' || phase === 'routing' || phase === 'working') {
-      setExpanded(true)
-    }
-  }, [phase])
 
   // Auto-scroll the live preview to the bottom as new text streams in.
   useEffect(() => {
     if (previewRef.current) {
       previewRef.current.scrollTop = previewRef.current.scrollHeight
     }
-  }, [streams, expanded])
+  }, [streams])
 
   if (!events.length && phase === 'idle' && !Object.keys(streams).length) return null
 
@@ -259,33 +248,72 @@ function ActivityTrail({ message }: { message: ChatMessage }) {
         </span>
       </button>
 
-      {/* Live preview — auto-scrolling streaming text (iOS glass console) */}
-      {hasStreams ? (
-        <div className="px-4 pb-1">
+      {/* Live preview — auto-scrolling glass viewport. The latest buffer is
+          highlighted (full opacity at the bottom); older text fades out through
+          a gradient mask, like looking through frosted glass. */}
+      {hasStreams || active ? (
+        <div className="px-4 pb-3">
           <div
             ref={previewRef}
             className={cn(
-              'relative overflow-hidden rounded-2xl border border-white/10 bg-black/25',
-              'backdrop-blur-md',
-              expanded ? 'max-h-[280px] overflow-y-auto' : 'max-h-[84px]',
+              'relative h-[120px] overflow-hidden rounded-2xl border border-white/10',
+              'bg-gradient-to-b from-white/[0.04] to-black/30',
+              'backdrop-blur-xl',
             )}
           >
-            {/* fade-to-transparent gradient at the top when collapsed */}
-            {!expanded ? (
-              <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-black/40 to-transparent" />
-            ) : null}
-            <div className="space-y-2 px-3.5 py-3">
-              {streamEntries.map(([name, text]) => (
-                <div key={name} className="min-w-0">
-                  <div className="mb-1 flex items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 rounded-full bg-blue-400/80" />
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{name}</span>
-                  </div>
-                  <p className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-300">
-                    {text || '…'}
-                  </p>
+            {/* Animated light sweep — iOS glass reflection feel */}
+            <motion.div
+              aria-hidden
+              className="pointer-events-none absolute inset-0 z-20"
+              initial={{ x: '-120%' }}
+              animate={{ x: '120%' }}
+              transition={{ duration: 2.6, ease: 'easeInOut', repeat: Infinity, repeatDelay: 1.4 }}
+              style={{
+                background:
+                  'linear-gradient(105deg, transparent 40%, rgba(255,255,255,0.06) 50%, transparent 60%)',
+              }}
+            />
+            {/* Gradient mask: top (old) fades to transparent, bottom (latest) is clear & highlighted */}
+            <div
+              className="pointer-events-none absolute inset-0 z-10"
+              style={{
+                background:
+                  'linear-gradient(to bottom, rgba(10,11,13,0.92) 0%, rgba(10,11,13,0.55) 35%, rgba(10,11,13,0) 70%, rgba(10,11,13,0) 100%)',
+              }}
+            />
+            {/* Bottom glow — emphasizes the latest buffer */}
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-10 bg-gradient-to-t from-blue-500/10 to-transparent" />
+
+            <div className="relative z-0 h-full overflow-y-auto px-4 py-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {hasStreams ? (
+                <div className="space-y-3">
+                  {streamEntries.map(([name, text]) => (
+                    <div key={name} className="min-w-0">
+                      <div className="mb-1 flex items-center gap-1.5">
+                        <span className="h-1.5 w-1.5 rounded-full bg-blue-400/80" />
+                        <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{name}</span>
+                      </div>
+                      <p className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-100">
+                        {text || '…'}
+                        {active ? (
+                          <span className="ml-0.5 inline-block h-3.5 w-[7px] translate-y-0.5 animate-pulse rounded-[1px] bg-blue-400" />
+                        ) : null}
+                      </p>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              ) : (
+                <div className="flex h-full items-center">
+                  <div className="flex items-center gap-2 text-[12px] text-zinc-500">
+                    <span className="flex gap-1">
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-400/70 [animation-delay:-0.3s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-400/70 [animation-delay:-0.15s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-400/70" />
+                    </span>
+                    <span>Waiting for specialist response…</span>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
