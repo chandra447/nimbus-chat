@@ -1,132 +1,43 @@
+"""App-level wiring that turns a SpecialistConfig into a running server.
+
+This is a thin adapter: it builds the app's chat model and a
+:class:`SpecialistServerConfig` from the app settings, then delegates to
+``nimbus_a2a.create_specialist_app``. All A2A / push-notification / streaming
+plumbing lives in the SDK.
+"""
+
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.ext.asyncio import create_async_engine
-
-from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.routes.agent_card_routes import create_agent_card_routes
-from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
-from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
-from a2a.server.routes.rest_routes import create_rest_routes
-from a2a.server.tasks import (
-    DatabasePushNotificationConfigStore,
-    DatabaseTaskStore,
-)
-from a2a.server.tasks.base_push_notification_sender import (
-    BasePushNotificationSender,
-)
 
 from app.checkpointing import create_sqlite_checkpointer
+from app.llm import build_chat_model
 from app.settings import Settings
-from app.specialist.builder import (
-    GenericSpecialistExecutor,
-    SpecialistConfig,
-    build_specialist_agent_card,
-)
+from nimbus_a2a import SpecialistConfig, SpecialistServerConfig
+from nimbus_a2a.server import create_specialist_app as _create_specialist_app_sdk
 
 
-def create_specialist_app(
-    settings: Settings,
-    config: SpecialistConfig,
-) -> FastAPI:
-    agent_card = build_specialist_agent_card(settings, config)
+def create_specialist_app(settings: Settings, config: SpecialistConfig) -> FastAPI:
+    model = build_chat_model(settings, streaming=config.streaming)
 
-    engine = create_async_engine(settings.sqlite_async_url, future=True)
-    task_store = DatabaseTaskStore(engine, table_name=config.tasks_table)
-    push_config_store = DatabasePushNotificationConfigStore(
-        engine,
-        table_name=config.push_notification_table,
+    async def checkpointer_factory():
+        return await create_sqlite_checkpointer(settings)
+
+    server = SpecialistServerConfig(
+        db_url=settings.sqlite_async_url,
+        public_url=settings.specialist_public_url,
+        internal_url=settings.specialist_internal_url,
+        cors_origins=settings.cors_origins,
+        tavily_api_key=settings.tavily_api_key,
+        tavily_enabled=settings.tavily_enabled,
     )
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        await task_store.initialize()
-        await push_config_store.initialize()
-
-        checkpointer_conn, checkpointer = await create_sqlite_checkpointer(settings)
-        executor = GenericSpecialistExecutor(settings, config, checkpointer=checkpointer)
-        import httpx
-        push_sender = BasePushNotificationSender(
-            httpx_client=httpx.AsyncClient(timeout=30.0),
-            config_store=push_config_store,
-        )
-        request_handler = DefaultRequestHandler(
-            agent_executor=executor,
-            task_store=task_store,
-            agent_card=agent_card,
-            push_config_store=push_config_store,
-            push_sender=push_sender,
-        )
-
-        app.state.specialist_agent_card = agent_card
-        app.state.specialist_executor = executor
-        app.state.specialist_request_handler = request_handler
-
-        add_a2a_routes_to_fastapi(
-            app,
-            agent_card_routes=create_agent_card_routes(agent_card),
-            jsonrpc_routes=create_jsonrpc_routes(
-                request_handler,
-                rpc_url='/a2a/jsonrpc',
-            ),
-            rest_routes=create_rest_routes(request_handler, path_prefix='/a2a'),
-        )
-
-        try:
-            yield
-        finally:
-            await checkpointer_conn.close()
-            await engine.dispose()
-
-    app = FastAPI(
-        title=f'{config.name}',
-        version=config.version,
-        lifespan=lifespan,
+    return _create_specialist_app_sdk(
+        config,
+        server,
+        model=model,
+        checkpointer_factory=checkpointer_factory,
     )
-    _cors_origins = [
-        origin.strip()
-        for origin in settings.cors_origins.split(',')
-    ]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=False,
-        allow_methods=['*'],
-        allow_headers=['*'],
-    )
-
-    @app.get('/health')
-    def healthcheck() -> dict[str, object]:
-        return {
-            'status': 'ok',
-            'specialist_type': config.table_name_prefix,
-            'specialist_public_url': settings.specialist_public_url,
-            'agent_name': agent_card.name,
-            'tavily_enabled': settings.tavily_enabled,
-            'tavily_configured': settings.tavily_configured,
-        }
-
-    @app.get('/api/specialist/agent-card')
-    def specialist_agent_card_preview() -> dict[str, object]:
-        return {
-            'name': agent_card.name,
-            'description': agent_card.description,
-            'skills': [
-                {
-                    'id': skill.id,
-                    'name': skill.name,
-                    'description': skill.description,
-                    'tags': list(skill.tags),
-                    'examples': list(skill.examples),
-                }
-                for skill in agent_card.skills
-            ],
-        }
-
-    return app
 
 
 # Backwards-compatible alias.

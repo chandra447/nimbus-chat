@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.specialist.builder import SpecialistConfig, SpecialistSkillSpec
+from nimbus_a2a import SpecialistConfig, SpecialistSkillSpec
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,7 @@ travel_config = SpecialistConfig(
     table_name_prefix='travel_specialist',
     artifact_name='travel-plan',
     agent_name_label='Travel Planner',
+    streaming=True,
     skills=[
         SpecialistSkillSpec(
             id='destination_planning',
@@ -110,6 +111,7 @@ nutrition_config = SpecialistConfig(
     table_name_prefix='nutrition_specialist',
     artifact_name='nutrition-plan',
     agent_name_label='Nutritionist',
+    streaming=False,
     skills=[
         SpecialistSkillSpec(
             id='meal_planning',
