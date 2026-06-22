@@ -38,7 +38,7 @@ graph TB
     ORC -.->|return_immediately<br/>+ push config| NS
     TS -->|POST push notifications| WH
     NS -.->|POST push notifications| WH
-    WH -->|Command(resume=...)<br/>resumes paused graph| ORC
+    WH -->|"Command(resume=...)<br/>resumes paused graph"| ORC
     ORC --> DB
     TS --> DB
     NS --> DB
@@ -63,48 +63,48 @@ sequenceDiagram
     participant WH as Orchestrator Webhook
 
     U->>F: "Plan a healthy Tokyo trip"
-    F->>O: POST /api/chat {message, context_id} (SSE)
-    O->>O: route node → RouteDecision (2 specialists)
-    O->>O: fan-out via Send → 2× specialist_wait nodes
-    Note over O: Each specialist_wait calls interrupt()<br/>Graph PAUSES (state checkpointed to SQLite)
+    F->>O: "POST /api/chat (SSE)"
+    O->>O: "route node → RouteDecision (2 specialists)"
+    O->>O: "fan-out via Send → 2x specialist_wait nodes"
+    Note over O: "Each specialist_wait calls interrupt()  Graph PAUSES (state checkpointed to SQLite)"
 
-    par Driver dispatches A2A (return_immediately)
-        O->>S1: SendMessage(return_immediately=true, push_config)
-        S1-->>O: 200 OK (task created)
+    par "Driver dispatches A2A (return_immediately)"
+        O->>S1: "SendMessage(return_immediately=true, push_config)"
+        S1-->>O: "200 OK (task created)"
     and
-        O->>S2: SendMessage(return_immediately=true, push_config)
-        S2-->>O: 200 OK (task created)
+        O->>S2: "SendMessage(return_immediately=true, push_config)"
+        S2-->>O: "200 OK (task created)"
     end
-    Note over S1,S2: Specialists work in background
+    Note over S1,S2: "Specialists work in background"
 
-    S1->>WH: POST /a2a/callback (chunks → activity trail)
-    S1->>WH: POST /a2a/callback (COMPLETED)
-    WH->>O: Command(resume={interrupt_1: response})
-    Note over O: Graph resumes branch 1, re-pauses (branch 2 still pending)
+    S1->>WH: "POST /a2a/callback (chunks)"
+    S1->>WH: "POST /a2a/callback (COMPLETED)"
+    WH->>O: "Command(resume=interrupt_1: response)"
+    Note over O: "Graph resumes branch 1, re-pauses (branch 2 still pending)"
 
-    S2->>WH: POST /a2a/callback (COMPLETED)
-    WH->>O: Command(resume={interrupt_2: response})
-    Note over O: Graph resumes branch 2 → all done → synthesize node
+    S2->>WH: "POST /a2a/callback (COMPLETED)"
+    WH->>O: "Command(resume=interrupt_2: response)"
+    Note over O: "Graph resumes branch 2, all done, synthesize node"
 
-    O-->>F: SSE: status + token (synthesized answer) + done
-    F-->>U: Render markdown + activity trail
+    O-->>F: "SSE: status + token (synthesized answer) + done"
+    F-->>U: "Render markdown + activity trail"
 ```
 
 ### Routing decision flow
 
 ```mermaid
 flowchart TD
-    Start["📨 POST /api/chat {message, context_id}"] --> Route["🧭 route node<br/>Router agent → RouteDecision<br/>(structured output)"]
+    Start["📨 POST /api/chat"] --> Route["🧭 route node<br/>Router agent → RouteDecision<br/>(structured output)"]
     Route --> Decide{"should_route?"}
 
     Decide -->|No| Respond["💬 respond node<br/>Responder agent streams tokens"]
     Decide -->|Yes| FanOut["⚡ Fan-out via Send<br/>one specialist_wait task per specialist"]
 
-    FanOut --> Interrupt["⏸️ specialist_wait calls interrupt()<br/>Graph PAUSES (SQLite checkpoint)<br/>Driver sends A2A return_immediately"]
-    Interrupt --> Wait["⏳ Webhook receives push notifications<br/>resumes each interrupt as specialist completes"]
+    FanOut --> Interrupt["⏸️ specialist_wait calls interrupt()<br/>Graph pauses to a SQLite checkpoint"]
+    Interrupt --> Wait["⏳ Webhook receives push notifications<br/>and resumes each interrupt"]
     Wait --> SynthCheck{"needs_synthesis?"}
-    SynthCheck -->|Yes| Synth["🧬 synthesize node<br/>Synthesizer agent streams unified answer"]
-    SynthCheck -->|No| Assemble["📝 assemble node<br/>section headers, no extra LLM call"]
+    SynthCheck -->|Yes| Synth["🧬 synthesize node<br/>Streams unified answer"]
+    SynthCheck -->|No| Assemble["📝 assemble node<br/>Adds section headers only"]
     Respond --> Done["✅ done event (SSE)"]
     Synth --> Done
     Assemble --> Done
@@ -280,17 +280,17 @@ sequenceDiagram
     participant C as Frontend (plain fetch)
     participant O as Orchestrator (StateGraph)
 
-    C->>O: POST /api/chat {message, context_id}
-    O-->>C: SSE stream opens
-    O-->>C: data: {type: status, phase: routing}
-    O-->>C: data: {type: status, phase: route_decision, specialists: [...]}
-    O-->>C: data: {type: status, phase: specialist_working}
-    O-->>C: data: {type: specialist_chunk, ...} (live, via push notification)
-    Note over O: graph paused at interrupts; webhook resumes
-    O-->>C: data: {type: status, phase: synthesizing}
-    O-->>C: data: {type: token, text: ...} (streamed markdown)
-    O-->>C: data: {type: done, final_response: ...}
-    O-->>C: SSE stream closes
+    C->>O: "POST /api/chat"
+    O-->>C: "SSE stream opens"
+    O-->>C: "status: routing"
+    O-->>C: "status: route_decision (specialists selected)"
+    O-->>C: "status: specialist_working"
+    O-->>C: "specialist_chunk (live, via push)"
+    Note over O: "graph paused at interrupts; webhook resumes"
+    O-->>C: "status: synthesizing"
+    O-->>C: "token: streamed markdown"
+    O-->>C: "done: final response"
+    O-->>C: "SSE stream closes"
 ```
 
 Event types: `status` (phase/lifecycle), `token` (main-response chunks), `specialist_chunk` (raw specialist output, live), `done` (terminal), `error`.
@@ -302,8 +302,8 @@ stateDiagram-v2
     [*] --> route: POST /api/chat
     route --> respond: no specialists
     route --> specialist_wait: fan-out via Send
-    specialist_wait --> Paused: interrupt() (SQLite checkpoint)
-    Paused --> specialist_wait: Command(resume) from webhook
+    specialist_wait --> Paused: "interrupt() (SQLite checkpoint)"
+    Paused --> specialist_wait: "Command(resume) from webhook"
     specialist_wait --> synthesize: all resumed + needs_synthesis
     specialist_wait --> assemble: all resumed, no synthesis
     respond --> [*]: done
@@ -320,16 +320,16 @@ Each conversation has a stable `contextId` (UUID) generated by the frontend. Thi
 ```mermaid
 graph LR
     FE["Frontend<br/>contextId = conversation.id"] -->|A2A message| ORC["Orchestrator<br/>thread_id = contextId"]
-    ORC -->|Router| RT["LangGraph thread<br/>{contextId}:route"]
-    ORC -->|Responder| RP["LangGraph thread<br/>{contextId}:respond"]
-    ORC -->|Specialist A2A| SP["Specialist<br/>{contextId}:travel"]
-    ORC -->|Synthesizer| SY["LangGraph thread<br/>{contextId}:synthesize"]
-    ORC -->|record_exchange| RP
+    ORC -->|Router| RT_["LangGraph thread<br/>(contextId):route"]
+    ORC -->|Responder| RP_["LangGraph thread<br/>(contextId):respond"]
+    ORC -->|Specialist A2A| SP_["Specialist<br/>(contextId):travel"]
+    ORC -->|Synthesizer| SY_["LangGraph thread<br/>(contextId):synthesize"]
+    ORC -->|record_exchange| RP_
 
-    RT --> CP[("SQLite Checkpoints")]
-    RP --> CP
-    SP --> CP
-    SY --> CP
+    RT_ --> CP_["(SQLite Checkpoints)"]
+    RP_ --> CP_
+    SP_ --> CP_
+    SY_ --> CP_
 ```
 
 When a specialist responds, the orchestrator calls `responder.record_exchange()` to inject the user message + specialist response into the responder's LangGraph thread (via `aupdate_state` with `as_node='model'`). This ensures **cross-path continuity**: a direct follow-up after a specialist-routed turn still has full context.
